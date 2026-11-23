@@ -122,6 +122,21 @@ class TestFxs(unittest.TestCase):
         self.assertIn("commit.gpgsign true", fxs.SIGNING_SETUP_SCRIPT)
         self.assertIn("fxs_signing", fxs.SIGNING_SETUP_SCRIPT)
 
+    def test_parse_teams_output_handles_stderr_table_and_vercel_slug(self):
+        sample = (
+            "Vercel CLI 66.6.0\n"
+            "\x1b[90mid                         Team name          Plan\x1b[0m\n"
+            "acme-personal              acme-personal      pro\n"
+            "vercel                     Vercel             enterprise\n"
+            "my-team_1                  My Team            enterprise\n"
+        )
+        self.assertEqual(fxs.parse_teams_output(sample), ["acme-personal", "vercel", "my-team_1"])
+
+    def test_resolve_default_project(self):
+        self.assertEqual(fxs.resolve_default_project(None), "vercel-sandbox-default-project")
+        self.assertEqual(fxs.resolve_default_project(""), "vercel-sandbox-default-project")
+        self.assertEqual(fxs.resolve_default_project("custom-proj"), "custom-proj")
+
 
 if __name__ == "__main__":
     unittest.main()

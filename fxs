@@ -349,11 +349,29 @@ def sync_pasted_images(cfg, name, paths, uploaded_cache):
             uploaded_cache[p] = mt
 
 
+def reset_local_terminal(saved_attrs=None):
+    """Restore local TTY + Kitty keyboard/mouse/paste modes if remote stream drops mid-TUI."""
+    if saved_attrs is not None:
+        with contextlib.suppress(Exception):
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_attrs)
+    if sys.stdout.isatty():
+        with contextlib.suppress(OSError):
+            os.write(
+                sys.stdout.fileno(),
+                b"\x1b[<u\x1b[<u\x1b[=0u"
+                b"\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+                b"\x1b[?1004l\x1b[?25h\x1b[0m",
+            )
+
+
 def run_interactive_with_image_sync(cfg, name, script):
     cmd = vc_args(cfg, "exec", "-i", *TERM_ENV, name, "--", "bash", "-lc", script)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return subprocess.call(cmd)
 
+    saved_attrs = None
+    with contextlib.suppress(Exception):
+        saved_attrs = termios.tcgetattr(sys.stdin.fileno())
     stop_event = threading.Event()
     uploaded = {}
     pulled_traces = set()
@@ -399,6 +417,7 @@ def run_interactive_with_image_sync(cfg, name, script):
     finally:
         stop_event.set()
         t.join(timeout=1.0)
+        reset_local_terminal(saved_attrs)
 
 
 def remote_exec(cfg, name, script, interactive=False, env=None, workdir=None, check=True, capture=False):
@@ -626,35 +645,39 @@ def vercel_logged_in():
     return p.returncode == 0, p.stdout.strip()
 
 
+def parse_teams_output(text):
+    clean = ANSI_CSI_RE.sub("", text)
+    teams = []
+    seen = set()
+    skip_first = {"id", "team", "vercel", "-", "fetching", ">", "error:", "warn:", "warning:"}
+    for raw in clean.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("-", ">", "Vercel CLI", "Fetching", "Tip:", "To ")):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        slug = parts[0]
+        if slug.lower() in skip_first and len(parts) >= 2 and parts[1].lower() in ("team", "cli", "name"):
+            continue
+        if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", slug) and slug not in ("id",) and slug not in seen:
+            seen.add(slug)
+            teams.append(slug)
+    return teams
+
+
 def discover_teams():
     p = subprocess.run(["vercel", "teams", "ls"], capture_output=True, text=True)
     if p.returncode != 0:
         return []
-    teams = []
-    for line in p.stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("id ") or line.startswith("-"):
-            continue
-        parts = line.split()
-        if parts and parts[0] not in ("id", "Team"):
-            teams.append(parts[0])
-    return teams
+    return parse_teams_output(p.stdout + "\n" + p.stderr)
 
 
-def discover_projects(team):
-    cmd = ["vercel", "projects", "ls"] + (["--scope", team] if team else [])
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        return []
-    projects = []
-    for line in p.stdout.splitlines():
-        s = line.strip()
-        if not s or s.startswith(">") or s.startswith("Project Name") or s.startswith("Next page") or s.startswith("All pages") or s.startswith("vercel "):
-            continue
-        col = line.split("\t")[0].strip()
-        if col:
-            projects.append(col)
-    return projects
+DEFAULT_SANDBOX_PROJECT = "vercel-sandbox-default-project"
+
+
+def resolve_default_project(old_project=None):
+    return old_project or DEFAULT_SANDBOX_PROJECT
 
 
 def prompt_choice(label, options, default_val=None):
@@ -714,14 +737,15 @@ def cmd_init(args):
         die("a Vercel team/scope is required", 2)
 
     if not project:
-        projects = discover_projects(team)
-        default_proj = old.get("project") or ("vercel-sandbox-default-project" if "vercel-sandbox-default-project" in projects else (projects[0] if projects else None))
+        default_proj = resolve_default_project(old.get("project"))
         if yes:
-            project = default_proj or die("pass --project <project>", 2)
-        elif projects:
-            project = prompt_choice(f"Choose a Vercel project under '{team}':", projects[:20], default_proj)
+            project = default_proj
         else:
-            project = input(f"Vercel project [{default_proj or ''}]: ").strip() or (default_proj or "")
+            print(
+                f"\nVercel project under '{team}' (press Enter for '{default_proj}', or type another project name):",
+                file=sys.stderr,
+            )
+            project = input(f"Vercel project [{default_proj}]: ").strip() or default_proj
     if not project:
         die("a Vercel project is required", 2)
 
