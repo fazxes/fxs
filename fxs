@@ -10,6 +10,9 @@ Usage:
   fxs pull NAME [--list | --all | PATH...] [--dest DIR]        sync sessions & pick files from a sandbox
   fxs local [ID]                                               list pulled fx sessions, or resume ID locally
   fxs watchdog [status|stop]                                   check or stop the idle auto-stop watchdog
+  fxs ssh NAME                                                 enable Tailscale SSH on an existing sandbox
+  fxs tailscale-key                                            save a reusable Tailscale auth key (auto-enables SSH)
+  fxs signing-setup [--sandbox NAME]                           enable SSH commit signing in base (or one sandbox)
   fxs mcp-login NAME... [--sandbox S]                          sign in to HTTP MCPs via your local browser
   fxs agents [list|add]                                        list built-in and custom agent shims
   fxs ls                                                       list sandboxes
@@ -21,12 +24,15 @@ Usage:
 import contextlib
 from dataclasses import dataclass, field
 import fcntl
+import getpass
 import hashlib
 import http.server
 import io
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -35,8 +41,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import threading
 import time
+import tty
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -55,6 +63,7 @@ CUSTOM_AGENTS_DIR = CONFIG_DIR / "agents"
 WATCHDOG_PID_FILE = CACHE_DIR / "watchdog.pid"
 WATCHDOG_LOCK_FILE = CACHE_DIR / "watchdog.lock"
 WATCHDOG_LOG_FILE = CACHE_DIR / "watchdog.log"
+TAILSCALE_KEY_FILE = CONFIG_DIR / "tailscale.key"
 PULL_DEFAULT_ROOT = Path(os.environ.get("FXS_PULL_DIR", str(HOME / "sandbox-pulls")))
 
 EXTRA_PATHS = [
@@ -304,6 +313,135 @@ def run_vc(cfg, sub, *args, check=True, capture=False):
     if check and rc != 0:
         die(f"vercel sandbox {sub} failed (exit {rc})")
     return rc
+
+
+IMAGE_PASTE_RE = re.compile(r"(/[^\r\n\"'<>\x1b]+?\.(?:png|jpe?g|webp|gif))", re.IGNORECASE)
+
+
+def extract_local_image_paths(data_bytes):
+    text = data_bytes.decode("utf-8", "ignore").replace("\\ ", " ")
+    found = []
+    for m in IMAGE_PASTE_RE.finditer(text):
+        p = m.group(1)
+        if os.path.isfile(p) and p not in found:
+            found.append(p)
+    return found
+
+
+def sync_pasted_images(cfg, name, paths, uploaded_cache):
+    to_send = []
+    for p in paths:
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if uploaded_cache.get(p) == mt:
+            continue
+        to_send.append((p, mt))
+    if not to_send:
+        return
+    parents = sorted({os.path.dirname(p) for p, _ in to_send})
+    mk = " && ".join(f"sudo mkdir -p {shlex.quote(d)} && sudo chown $(id -u):$(id -g) {shlex.quote(d)}" for d in parents)
+    subprocess.run(vc_args(cfg, "exec", name, "--", "bash", "-lc", mk), capture_output=True)
+    for p, mt in to_send:
+        cp = subprocess.run(vc_args(cfg, "copy", p, f"{name}:{p}"), capture_output=True)
+        if cp.returncode == 0:
+            uploaded_cache[p] = mt
+
+
+def run_interactive_with_image_sync(cfg, name, script):
+    cmd = vc_args(cfg, "exec", "-i", *TERM_ENV, name, "--", "bash", "-lc", script)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return subprocess.call(cmd)
+
+    in_fd = sys.stdin.fileno()
+    out_fd = sys.stdout.fileno()
+    old_tty = termios.tcgetattr(in_fd)
+    master_fd, slave_fd = pty.openpty()
+
+    def sync_winsize():
+        try:
+            ws = fcntl.ioctl(in_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+
+    sync_winsize()
+    prev_winch = signal.getsignal(signal.SIGWINCH)
+    signal.signal(signal.SIGWINCH, lambda *_: sync_winsize())
+
+    proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)
+    os.close(slave_fd)
+
+    uploaded_cache = {}
+    paste_buf = bytearray()
+    in_paste = False
+    paste_deadline = 0.0
+
+    def write_all(fd, data):
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+
+    def flush_paste():
+        nonlocal in_paste
+        raw = bytes(paste_buf)
+        paste_buf.clear()
+        in_paste = False
+        imgs = extract_local_image_paths(raw)
+        if imgs:
+            sync_pasted_images(cfg, name, imgs, uploaded_cache)
+        write_all(master_fd, raw)
+
+    try:
+        tty.setraw(in_fd)
+        while True:
+            timeout = max(0.0, paste_deadline - time.monotonic()) if in_paste else None
+            rlist = [master_fd] if proc.poll() is not None else [in_fd, master_fd]
+            try:
+                ready, _, _ = select.select(rlist, [], [], timeout)
+            except InterruptedError:
+                continue
+            if in_paste and not ready:
+                flush_paste()
+                continue
+            if master_fd in ready:
+                try:
+                    out = os.read(master_fd, 16384)
+                except OSError:
+                    out = b""
+                if not out:
+                    break
+                write_all(out_fd, out)
+            if in_fd in ready:
+                try:
+                    chunk = os.read(in_fd, 4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                if in_paste:
+                    paste_buf.extend(chunk)
+                    if b"\x1b[201~" in paste_buf:
+                        flush_paste()
+                elif b"\x1b[200~" in chunk:
+                    in_paste = True
+                    paste_buf.extend(chunk)
+                    paste_deadline = time.monotonic() + 0.15
+                    if b"\x1b[201~" in paste_buf:
+                        flush_paste()
+                else:
+                    imgs = extract_local_image_paths(chunk)
+                    if imgs:
+                        sync_pasted_images(cfg, name, imgs, uploaded_cache)
+                    write_all(master_fd, chunk)
+        return proc.wait()
+    finally:
+        signal.signal(signal.SIGWINCH, prev_winch)
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
+        termios.tcsetattr(in_fd, termios.TCSADRAIN, old_tty)
 
 
 def remote_exec(cfg, name, script, interactive=False, env=None, workdir=None, check=True, capture=False):
@@ -687,6 +825,7 @@ def build_base_setup_script(cfg, agents_to_install):
         'if [ -f /tmp/fxs-creds.tgz ]; then (umask 077 && tar -xzf /tmp/fxs-creds.tgz -C "$HOME") && rm -f /tmp/fxs-creds.tgz; fi',
         "missing=()",
         "for cmd in git rg jq curl unzip dtach; do command -v \"$cmd\" >/dev/null 2>&1 || missing+=(\"$cmd\"); done",
+        "command -v ssh-keygen >/dev/null 2>&1 || missing+=(openssh-client)",
         "command -v xz >/dev/null 2>&1 || missing+=(xz-utils)",
     ]
     if "gh" in tools:
@@ -737,6 +876,31 @@ fi
     for shim in selected:
         lines.append(f'log "installing agent: {shim.name}"')
         lines.append(shim.install_cmd)
+
+    lines.append(r'''
+if [ ! -x /usr/local/bin/tailscaled ]; then
+  arch="$(uname -m)"
+  ts_arch="amd64"; [ "$arch" = "aarch64" ] && ts_arch="arm64"
+  pkg="$(curl -fsSL "https://pkgs.tailscale.com/stable/?mode=json" | python3 -c "import json,sys; print(json.load(sys.stdin)['Tarballs'][sys.argv[1]])" "$ts_arch")"
+  log "installing $pkg"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/ts.tgz" "https://pkgs.tailscale.com/stable/$pkg"
+  tar -xzf "$tmp/ts.tgz" -C "$tmp"
+  sudo install -m 755 "$tmp"/tailscale_*/tailscale /usr/local/bin/tailscale
+  sudo install -m 755 "$tmp"/tailscale_*/tailscaled /usr/local/bin/tailscaled
+  rm -rf "$tmp"
+fi
+sudo tee /usr/local/bin/fxs-attach >/dev/null <<'FXA'
+#!/bin/sh
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"
+if [ -S /tmp/fxs-agent.sock ]; then
+  exec dtach -a /tmp/fxs-agent.sock -E -z -r winch
+fi
+echo "No active agent session socket found (/tmp/fxs-agent.sock)." >&2
+exit 1
+FXA
+sudo chmod 755 /usr/local/bin/fxs-attach
+'''.strip())
 
     if git_name:
         lines.append(f"git config --global user.name {shlex.quote(git_name)}")
@@ -1407,7 +1571,7 @@ def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resu
             'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"; '
             f'{exports}exec dtach -A /tmp/fxs-agent.sock -E -z -r winch {cmd}'
         )
-        rc = remote_exec(cfg, name, script, interactive=True, check=False)
+        rc = run_interactive_with_image_sync(cfg, name, script)
         first = False
         alive = remote_exec(
             cfg, name,
@@ -1458,12 +1622,197 @@ def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resu
     say(f"sandbox {name}: resume with `fxs resume {name}` | stop with `fxs stop {name}` | remove with `fxs rm {name}`")
 
 
+def start_sandbox_tailscale(cfg, name, interactive_if_no_key=False):
+    key = ""
+    if TAILSCALE_KEY_FILE.exists():
+        key = TAILSCALE_KEY_FILE.read_text().strip()
+    elif not interactive_if_no_key:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        key_copied = False
+        if key:
+            kf = Path(tmp) / "ts.key"
+            kf.write_text(key + "\n")
+            os.chmod(kf, 0o600)
+            run_vc(cfg, "copy", str(kf), f"{name}:/tmp/fxs-ts.key", capture=True)
+            key_copied = True
+
+    start_script = '''
+set -euo pipefail
+ts_dir="$HOME/.config/fxs-tailscale"
+mkdir -p -m 700 "$ts_dir"
+if ! tailscale --socket=/tmp/fxs-ts.sock status >/dev/null 2>&1; then
+  sudo python3 - "$ts_dir" <<'PYTS'
+import os, subprocess, sys
+fd = os.open("/tmp/fxs-tsd.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+dn = os.open("/dev/null", os.O_RDONLY)
+env = dict(os.environ, TS_ASSUME_NETWORK_UP_FOR_TEST="1")
+subprocess.Popen(
+    ["/usr/local/bin/tailscaled", "--tun=userspace-networking",
+     "--statedir=" + sys.argv[1],
+     "--socket=/tmp/fxs-ts.sock"],
+    stdin=dn, stdout=fd, stderr=fd, start_new_session=True, close_fds=True,
+)
+PYTS
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S /tmp/fxs-ts.sock ] && break
+    sleep 0.3
+  done
+fi
+if [ -f /tmp/fxs-ts.key ]; then
+  sudo tailscale --socket=/tmp/fxs-ts.sock up --ssh --hostname=__NAME__ --auth-key=file:/tmp/fxs-ts.key --timeout=20s
+  rm -f /tmp/fxs-ts.key
+else
+  sudo tailscale --socket=/tmp/fxs-ts.sock up --ssh --hostname=__NAME__ --timeout=30s
+fi
+ts_ip="$(tailscale --socket=/tmp/fxs-ts.sock ip -4 2>/dev/null | head -1 || true)"
+ts_dns="$(tailscale --socket=/tmp/fxs-ts.sock status --json 2>/dev/null | python3 -c "import json,sys; print((json.load(sys.stdin).get('Self') or {}).get('DNSName','').rstrip('.'))" 2>/dev/null || true)"
+echo "TS_READY|$ts_dns|$ts_ip"
+'''.replace("__NAME__", shlex.quote(name))
+    p = remote_exec(cfg, name, start_script, interactive=(not key_copied), check=False, capture=key_copied)
+    if key_copied and p.returncode == 0:
+        for line in p.stdout.splitlines():
+            if line.startswith("TS_READY|"):
+                _, dns, ip = (line.split("|") + ["", ""])[:3]
+                host = dns or ip or name
+                say(f"Tailscale SSH: ubuntu@{host} (ip {ip or '?'}) | run `fxs-attach` inside SSH")
+                break
+    elif key_copied:
+        say(f"Tailscale SSH setup failed on {name}: {(p.stdout + p.stderr).strip()[-300:]}")
+    else:
+        say(f"Tailscale SSH ready for {name}: connect as ubuntu@{name} and run `fxs-attach`")
+
+
+def cmd_tailscale_key(_args):
+    print("Create a Reusable (+ Ephemeral) auth key in Tailscale Admin -> Settings -> Keys.", file=sys.stderr)
+    key = getpass.getpass("Paste Tailscale auth key (input hidden): ").strip()
+    if not key:
+        die("empty key, nothing saved", 2)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(TAILSCALE_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+    say(f"saved Tailscale auth key to {TAILSCALE_KEY_FILE}")
+
+
+def cmd_ssh(args):
+    if not args:
+        die("usage: fxs ssh <sandbox-name>", 2)
+    start_sandbox_tailscale(require_config(), args[0], interactive_if_no_key=True)
+
+
+SIGNING_SETUP_SCRIPT = r'''set -euo pipefail
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-client >/dev/null
+fi
+mkdir -p -m 700 "$HOME/.ssh"
+email="$(git config --global user.email || echo 'sandbox@localhost')"
+if [ ! -f "$HOME/.ssh/fxs_signing" ]; then
+  ssh-keygen -q -t ed25519 -N '' -C "$email fxs sandbox signing" -f "$HOME/.ssh/fxs_signing"
+fi
+chmod 600 "$HOME/.ssh/fxs_signing"
+chmod 644 "$HOME/.ssh/fxs_signing.pub"
+pub="$(cut -d' ' -f1-2 "$HOME/.ssh/fxs_signing.pub")"
+printf '%s %s\n' "$email" "$pub" > "$HOME/.ssh/allowed_signers"
+git config --global gpg.format ssh
+git config --global user.signingkey "$HOME/.ssh/fxs_signing.pub"
+git config --global gpg.ssh.allowedSignersFile "$HOME/.ssh/allowed_signers"
+git config --global commit.gpgsign true
+git config --global tag.gpgsign true
+echo "FXS_SIGNING_PUB|$(cat "$HOME/.ssh/fxs_signing.pub")"
+'''
+
+
+def register_signing_pub_on_github(pub_line):
+    if not shutil.which("gh"):
+        return False
+    pub_key_only = " ".join(pub_line.strip().split()[:2])
+    chk = subprocess.run(
+        ["gh", "api", "user/ssh_signing_keys", "--paginate", "--jq", ".[].key"],
+        capture_output=True, text=True,
+    )
+    if chk.returncode == 0:
+        existing = [" ".join(l.strip().split()[:2]) for l in chk.stdout.splitlines() if l.strip()]
+        if pub_key_only in existing:
+            say("signing key is already registered on GitHub")
+            return True
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = Path(tmp) / "fxs_signing.pub"
+            kf.write_text(pub_line.strip() + "\n")
+            add = subprocess.run(
+                ["gh", "ssh-key", "add", str(kf), "--type", "signing", "--title", "fxs sandbox"],
+                capture_output=True, text=True,
+            )
+            if add.returncode == 0:
+                say("added signing key to GitHub")
+                return True
+    return False
+
+
+def cmd_signing_setup(args):
+    cfg = require_config()
+    sb_name, rest = parse_flag(args, "--sandbox", has_value=True)
+    if rest:
+        die("usage: fxs signing-setup [--sandbox NAME]", 2)
+
+    if sb_name:
+        p = remote_exec(cfg, sb_name, SIGNING_SETUP_SCRIPT, capture=True)
+        pub = ""
+        for line in p.stdout.splitlines():
+            if line.startswith("FXS_SIGNING_PUB|"):
+                pub = line.split("|", 1)[1].strip()
+        if pub and not register_signing_pub_on_github(pub):
+            say("add this public key on GitHub as Key type = 'Signing Key' (https://github.com/settings/ssh/new):")
+            print(pub)
+        return
+
+    with file_lock(CACHE_DIR / "base.lock"):
+        base = ensure_base(cfg)
+        tmp_sb = "fxs-sign-" + uuid.uuid4().hex[:6]
+        say(f"configuring SSH commit signing in base snapshot {base['snapshot']}")
+        run_vc(cfg, "create", "--name", tmp_sb, "--snapshot", base["snapshot"], "--vcpus", "2", "--timeout", "10m", capture=True)
+        try:
+            p = remote_exec(cfg, tmp_sb, SIGNING_SETUP_SCRIPT, capture=True)
+            pub = ""
+            for line in p.stdout.splitlines():
+                if line.startswith("FXS_SIGNING_PUB|"):
+                    pub = line.split("|", 1)[1].strip()
+            remote_exec(cfg, tmp_sb, r'''set -euo pipefail
+d=$(mktemp -d)
+cd "$d"
+git init -q
+git config user.name >/dev/null 2>&1 || git config user.name "fxs"
+git config user.email >/dev/null 2>&1 || git config user.email "sandbox@localhost"
+echo ok > f && git add f
+git commit -q -m "verify signing"
+sig=$(git log -1 --format="%G?")
+rm -rf "$d"
+[ "$sig" = "G" ]
+''', capture=True)
+            snap = run_vc(cfg, "snapshot", "--stop", "--expiration", "0", tmp_sb, capture=True)
+            m = re.search(r"snap_[A-Za-z0-9]+", snap.stdout + snap.stderr)
+            if not m:
+                die("could not find snapshot ID in output")
+            base["snapshot"] = m.group(0)
+            base["created"] = time.time()
+            write_json(BASE_FILE, base)
+            say(f"base snapshot {base['snapshot']} updated with SSH commit signing")
+            if pub and not register_signing_pub_on_github(pub):
+                say("add this public key on GitHub as Key type = 'Signing Key' (https://github.com/settings/ssh/new):")
+                print(pub)
+        finally:
+            subprocess.run(vc_args(cfg, "rm", tmp_sb), capture_output=True)
+
+
 def cmd_new(args):
     cfg = require_config()
     flags, agent_args = split_passthrough(args)
     name, flags = parse_flag(flags, "--name", has_value=True)
     agent_name, flags = parse_flag(flags, "--agent", has_value=True)
     do_split, flags = parse_flag(flags, "--split", has_value=False)
+    want_ssh, flags = parse_flag(flags, "--ssh", has_value=False)
     vcpus, flags = parse_flag(flags, "--vcpus", has_value=True)
     timeout, flags = parse_flag(flags, "--timeout", has_value=True)
     if flags:
@@ -1494,6 +1843,8 @@ def cmd_new(args):
     if agent_name not in (base.get("agents") or []):
         shim = get_shim(agent_name, cfg)
         remote_exec(cfg, name, f"set -e; {shim.install_cmd}", interactive=sys.stdin.isatty())
+    if (TAILSCALE_KEY_FILE.exists() or want_ssh) and not os.environ.get("FXS_NO_TAILSCALE"):
+        start_sandbox_tailscale(cfg, name, interactive_if_no_key=want_ssh)
     run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False)
 
 
@@ -1770,6 +2121,8 @@ def cmd_resume(args):
     agent_name = agent_flag or known_agent or cfg.get("default_agent", "fx")
     if resume_id:
         say(f"resuming {name} ({agent_name} session {resume_id})")
+    if TAILSCALE_KEY_FILE.exists() and not os.environ.get("FXS_NO_TAILSCALE"):
+        start_sandbox_tailscale(cfg, name, interactive_if_no_key=False)
     run_agent_loop(cfg, name, agent_name, agent_args, continue_first=True, resume_id=resume_id)
 
 
@@ -1887,6 +2240,12 @@ def main(argv):
         return cmd_local(argv[1:])
     if sub == "watchdog":
         return cmd_watchdog(argv[1:])
+    if sub == "ssh":
+        return cmd_ssh(argv[1:])
+    if sub == "tailscale-key":
+        return cmd_tailscale_key(argv[1:])
+    if sub == "signing-setup":
+        return cmd_signing_setup(argv[1:])
     if sub == "agents":
         return cmd_agents(argv[1:])
     if sub in ("resume", "r"):

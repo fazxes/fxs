@@ -95,10 +95,32 @@ class TestFxs(unittest.TestCase):
         }
         script = fxs.build_base_setup_script(cfg, ["fx", "claude"])
         self.assertIn("dtach", script)
+        self.assertIn("openssh-client", script)
+        self.assertIn("tailscaled", script)
+        self.assertIn("fxs-attach", script)
         self.assertIn("zig", script)
         self.assertIn("bun", script)
         self.assertIn("https://fx.sh/setup.sh", script)
         self.assertIn("@anthropic-ai/claude-code", script)
+
+    def test_extract_local_image_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = Path(tmp) / "clip-123.png"
+            img1.write_bytes(b"png")
+            img2 = Path(tmp) / "my shot.jpg"
+            img2.write_bytes(b"jpg")
+            missing = Path(tmp) / "nope.png"
+
+            raw = f"\x1b[200~{img1}\n{missing}\x1b[201~".encode()
+            self.assertEqual(fxs.extract_local_image_paths(raw), [str(img1)])
+
+            escaped = str(img2).replace(" ", "\\ ").encode()
+            self.assertEqual(fxs.extract_local_image_paths(escaped), [str(img2)])
+
+    def test_signing_setup_script_has_ssh_config(self):
+        self.assertIn("gpg.format ssh", fxs.SIGNING_SETUP_SCRIPT)
+        self.assertIn("commit.gpgsign true", fxs.SIGNING_SETUP_SCRIPT)
+        self.assertIn("fxs_signing", fxs.SIGNING_SETUP_SCRIPT)
 
 
 if __name__ == "__main__":

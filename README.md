@@ -9,6 +9,9 @@ Run persistent cloud coding agents (`fx`, `claude`, `codex`, `opencode`, or cust
 - **Persistent across laptop sleep (`dtach`):** Runs agents inside `dtach` on the sandbox host instead of `tmux`, keeping native terminal scrolling, selection, and copy/paste intact while letting long tasks continue in the cloud if your laptop sleeps.
 - **Idle watchdog & bounded sessions:** Defaults to a `6h` session cap, auto-extends `+2h` while the agent is actively working, and stops the sandbox after `30` idle minutes (`FXS_IDLE_MINUTES`) so compute billing pauses while disk state stays preserved.
 - **Local session & file sync:** Syncs `fx` session history back to your machine on exit (so `fx -r <id>` or `fxs local <id>` works even after removing the sandbox) and lets you pick which workspace files to copy locally (`fxs pull`).
+- **Image paste sync:** Automatically detects local image paths pasted into the terminal (e.g. clipboard screenshots) and copies them to the matching path inside the sandbox before forwarding the paste.
+- **Direct mobile/SSH access (`Tailscale SSH`):** Save a reusable Tailscale auth key with `fxs tailscale-key` (or run `fxs ssh <sandbox>`) so every sandbox joins your tailnet and accepts SSH connections (for example from Termius on iOS) with `fxs-attach` to attach to the live agent session.
+- **Verified SSH commit signing (`fxs signing-setup`):** Generates a dedicated sandbox SSH signing key (`~/.ssh/fxs_signing`), configures `gpg.format=ssh` + `commit.gpgsign=true`, and registers the public key on GitHub when `gh` has `admin:ssh_signing_key`.
 - **Side-by-side Rex panes:** `fxs --split` and `fxs group N` open multiple independent sandboxes side by side when running inside [Rex](https://www.superlogical.com/rex).
 
 ## Install
@@ -59,8 +62,11 @@ fxs pull <sandbox>           # sync sessions and interactively pick files to kee
 fxs pull <sandbox> --list    # JSON list of files in the sandbox
 fxs local                    # list locally saved sandbox sessions
 
-fxs watchdog status          # inspect idle watchdog state
-fxs ls                       # list sandboxes
+fxs watchdog status                  # inspect idle watchdog state
+fxs tailscale-key                    # save reusable Tailscale auth key (auto-enables SSH)
+fxs ssh <sandbox>                    # enable Tailscale SSH on an existing sandbox
+fxs signing-setup [--sandbox NAME]   # enable SSH commit signing in base or one sandbox
+fxs ls                               # list sandboxes
 fxs stop <sandbox>           # stop sandbox (keeps disk, pauses billing)
 fxs rm <sandbox>             # delete sandbox
 ```
