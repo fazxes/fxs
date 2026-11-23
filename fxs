@@ -316,6 +316,7 @@ def run_vc(cfg, sub, *args, check=True, capture=False):
 
 
 IMAGE_PASTE_RE = re.compile(r"(/[^\r\n\"'<>\x1b]+?\.(?:png|jpe?g|webp|gif))", re.IGNORECASE)
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def extract_local_image_paths(data_bytes):
