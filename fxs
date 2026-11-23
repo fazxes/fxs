@@ -1,0 +1,1910 @@
+#!/usr/bin/env python3
+"""fxs: run persistent coding agents (fx, claude, codex, opencode, or custom shims) in Vercel Sandboxes.
+
+Usage:
+  fxs init [--yes] [--team T] [--project P] [--agent A] ...   first-time onboarding (interactive or agent-friendly)
+  fxs [--agent A] [--name N] [--timeout 6h] [-- <args...>]     create a sandbox and run the agent in this pane
+  fxs --split [--agent A] [-- <args...>]                       open a new sandbox in a Rex pane beside this one
+  fxs group N [--workspace [LABEL]] [--agent A]                open N sandboxes side by side in Rex
+  fxs resume [NAME|ID] [-- <args...>]                          wake/reattach a sandbox by name or session ID
+  fxs pull NAME [--list | --all | PATH...] [--dest DIR]        sync sessions & pick files from a sandbox
+  fxs local [ID]                                               list pulled fx sessions, or resume ID locally
+  fxs watchdog [status|stop]                                   check or stop the idle auto-stop watchdog
+  fxs mcp-login NAME... [--sandbox S]                          sign in to HTTP MCPs via your local browser
+  fxs agents [list|add]                                        list built-in and custom agent shims
+  fxs ls                                                       list sandboxes
+  fxs stop NAME...                                             stop sandboxes (keeps disk, pauses billing)
+  fxs rm NAME...                                               permanently remove sandboxes
+  fxs shell NAME                                               open bash in an existing sandbox
+  fxs base [--from SANDBOX] [--no-warm]                        build or rebuild the base snapshot
+"""
+import contextlib
+from dataclasses import dataclass, field
+import fcntl
+import hashlib
+import http.server
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import uuid
+from pathlib import Path
+
+ZIG_VERSION = os.environ.get("FXS_ZIG_VERSION", "0.17.0")
+BUN_VERSION = os.environ.get("FXS_BUN_VERSION", "1.3.14")
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("FXS_CONFIG_DIR", str(HOME / ".config" / "fxs")))
+CACHE_DIR = Path(os.environ.get("FXS_CACHE_DIR", str(HOME / ".cache" / "fxs")))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+BASE_FILE = CONFIG_DIR / "base.json"
+SANDBOXES_FILE = CONFIG_DIR / "sandboxes.json"
+SESSIONS_INDEX = CONFIG_DIR / "sessions.json"
+CUSTOM_AGENTS_DIR = CONFIG_DIR / "agents"
+WATCHDOG_PID_FILE = CACHE_DIR / "watchdog.pid"
+WATCHDOG_LOCK_FILE = CACHE_DIR / "watchdog.lock"
+WATCHDOG_LOG_FILE = CACHE_DIR / "watchdog.log"
+PULL_DEFAULT_ROOT = Path(os.environ.get("FXS_PULL_DIR", str(HOME / "sandbox-pulls")))
+
+EXTRA_PATHS = [
+    str(HOME / ".local" / "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    str(HOME / "Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS"),
+]
+_cur_path = os.environ.get("PATH", "").split(":")
+os.environ["PATH"] = ":".join([p for p in EXTRA_PATHS if p not in _cur_path] + _cur_path)
+
+TERM_ENV = [
+    "-e", "TERM=xterm-256color",
+    "-e", "COLORTERM=truecolor",
+    "-e", "LANG=C.UTF-8",
+]
+
+SESSION_MEMBER_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}/(?:log\.jsonl|blobs/[A-Za-z0-9_-]+)$")
+SKILL_SKIP = {".DS_Store", ".git", "node_modules", "__pycache__", ".venv", "venv"}
+
+
+@dataclass
+class AgentShim:
+    name: str
+    description: str
+    bin_path: str
+    install_cmd: str
+    auth_check_cmd: str
+    auth_login_cmd: str
+    skills_dir: str
+    session_subdir: str
+    supports_session_sync: bool = False
+    extra_env: dict = field(default_factory=dict)
+    resume_flag: str = "--resume"
+    continue_flag: str = "--continue"
+    subcommand_resume: bool = False
+
+    def launch_command(self, args, resume_id=None, continue_last=False):
+        extra = []
+        if resume_id:
+            if self.subcommand_resume:
+                extra.extend(["resume", resume_id])
+            else:
+                extra.extend([self.resume_flag, resume_id])
+        elif continue_last:
+            if self.subcommand_resume:
+                extra.extend(["resume", "--last"])
+            else:
+                extra.append(self.continue_flag)
+        extra.extend(args)
+        bin_expr = self.bin_path if self.bin_path.startswith("$HOME/") else shlex.quote(self.bin_path)
+        return " ".join([bin_expr, *(shlex.quote(p) for p in extra)])
+
+
+def builtin_shims(cfg=None):
+    fx_channel = (cfg or {}).get("fx_channel", "stable")
+    fx_upgrade = (
+        '"$HOME/.local/bin/fx" upgrade --channel dev >/dev/null 2>&1 || true; '
+        if fx_channel == "dev" else ""
+    )
+    return {
+        "fx": AgentShim(
+            name="fx",
+            description="fx coding agent (default)",
+            bin_path="$HOME/.local/bin/fx",
+            install_cmd=(
+                'if [ ! -x "$HOME/.local/bin/fx" ]; then '
+                'curl -fsSL https://fx.sh/setup.sh | bash >/dev/null; '
+                'fi; '
+                f'{fx_upgrade}'
+                'sudo ln -sfn "$HOME/.local/bin/fx" /usr/local/bin/fx'
+            ),
+            auth_check_cmd='fx status --json 2>/dev/null | grep -q \'"fx login"\'',
+            auth_login_cmd='FX_NO_OPEN_BROWSER=1 fx login && fx teams',
+            skills_dir=".fx/skills",
+            session_subdir=".fx/sessions/v2",
+            supports_session_sync=True,
+            resume_flag="-r",
+            continue_flag="-c",
+        ),
+        "claude": AgentShim(
+            name="claude",
+            description="Anthropic Claude Code CLI",
+            bin_path="claude",
+            install_cmd=(
+                'if ! command -v claude >/dev/null 2>&1; then '
+                'npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 '
+                '|| curl -fsSL https://claude.ai/install.sh | bash >/dev/null; '
+                'fi'
+            ),
+            auth_check_cmd='[ -n "${ANTHROPIC_API_KEY:-}" ] || [ -f "$HOME/.claude/.credentials.json" ] || [ -f "$HOME/.claude.json" ]',
+            auth_login_cmd='claude auth login || claude',
+            skills_dir=".claude/skills",
+            session_subdir=".claude/projects",
+            supports_session_sync=True,
+            resume_flag="--resume",
+            continue_flag="--continue",
+        ),
+        "codex": AgentShim(
+            name="codex",
+            description="OpenAI Codex CLI",
+            bin_path="codex",
+            install_cmd='command -v codex >/dev/null 2>&1 || npm install -g @openai/codex >/dev/null 2>&1',
+            auth_check_cmd='[ -n "${OPENAI_API_KEY:-}" ] || [ -f "$HOME/.codex/auth.json" ]',
+            auth_login_cmd='codex login --device-auth || codex login',
+            skills_dir=".codex/skills",
+            session_subdir=".codex/sessions",
+            supports_session_sync=True,
+            subcommand_resume=True,
+        ),
+        "opencode": AgentShim(
+            name="opencode",
+            description="OpenCode CLI",
+            bin_path="$HOME/.opencode/bin/opencode",
+            install_cmd=(
+                'if ! command -v opencode >/dev/null 2>&1 && [ ! -x "$HOME/.opencode/bin/opencode" ]; then '
+                'curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1 '
+                '|| npm install -g opencode-ai >/dev/null 2>&1; '
+                'fi; '
+                'if command -v opencode >/dev/null 2>&1; then sudo ln -sfn "$(command -v opencode)" /usr/local/bin/opencode; '
+                'elif [ -x "$HOME/.opencode/bin/opencode" ]; then sudo ln -sfn "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode; fi'
+            ),
+            auth_check_cmd='[ -d "$HOME/.local/share/opencode" ] && [ -n "$(ls -A "$HOME/.local/share/opencode" 2>/dev/null)" ]',
+            auth_login_cmd='opencode auth login',
+            skills_dir=".config/opencode/skills",
+            session_subdir=".local/share/opencode",
+            supports_session_sync=False,
+            resume_flag="--session",
+            continue_flag="--continue",
+        ),
+    }
+
+
+def load_custom_shims():
+    shims = {}
+    if not CUSTOM_AGENTS_DIR.is_dir():
+        return shims
+    for p in sorted(CUSTOM_AGENTS_DIR.glob("*.json")):
+        try:
+            d = json.loads(p.read_text())
+            name = d.get("name") or p.stem
+            shims[name] = AgentShim(
+                name=name,
+                description=d.get("description", f"Custom shim ({name})"),
+                bin_path=d["bin_path"],
+                install_cmd=d.get("install_cmd", "true"),
+                auth_check_cmd=d.get("auth_check_cmd", "true"),
+                auth_login_cmd=d.get("auth_login_cmd", "true"),
+                skills_dir=d.get("skills_dir", ".agents/skills"),
+                session_subdir=d.get("session_subdir", ""),
+                supports_session_sync=bool(d.get("supports_session_sync", False)),
+                extra_env=d.get("extra_env") or {},
+                resume_flag=d.get("resume_flag", "--resume"),
+                continue_flag=d.get("continue_flag", "--continue"),
+                subcommand_resume=bool(d.get("subcommand_resume", False)),
+            )
+        except Exception as e:
+            say(f"warning: skipping invalid custom shim {p}: {e}")
+    return shims
+
+
+def all_shims(cfg=None):
+    shims = builtin_shims(cfg)
+    shims.update(load_custom_shims())
+    return shims
+
+
+def get_shim(name, cfg=None):
+    shims = all_shims(cfg)
+    if name not in shims:
+        die(f"unknown agent '{name}'. Available: {', '.join(sorted(shims))}", 2)
+    return shims[name]
+
+
+def say(msg):
+    print(f"fxs: {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg, code=1):
+    say(msg)
+    sys.exit(code)
+
+
+def read_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+@contextlib.contextmanager
+def file_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def read_config():
+    return read_json(CONFIG_FILE, {})
+
+
+def require_config():
+    cfg = read_config()
+    if cfg.get("team") and cfg.get("project"):
+        return cfg
+    if sys.stdin.isatty():
+        say("no fxs config found yet; starting onboarding")
+        cmd_init([])
+        cfg = read_config()
+        if cfg.get("team") and cfg.get("project"):
+            return cfg
+    die("fxs is not configured yet. Run: fxs init --team <team> --project <project>", 2)
+
+
+def vc_args(cfg, sub, *args):
+    cmd = ["vercel", "sandbox", sub]
+    if cfg.get("team"):
+        cmd.extend(["--scope", cfg["team"]])
+    if cfg.get("project"):
+        cmd.extend(["--project", cfg["project"]])
+    cmd.extend(args)
+    return cmd
+
+
+def run_vc(cfg, sub, *args, check=True, capture=False):
+    cmd = vc_args(cfg, sub, *args)
+    if capture:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if check and p.returncode != 0:
+            sys.stderr.write((p.stdout + p.stderr)[-3000:])
+            die(f"vercel sandbox {sub} failed (exit {p.returncode})")
+        return p
+    rc = subprocess.call(cmd)
+    if check and rc != 0:
+        die(f"vercel sandbox {sub} failed (exit {rc})")
+    return rc
+
+
+def remote_exec(cfg, name, script, interactive=False, env=None, workdir=None, check=True, capture=False):
+    args = []
+    if interactive:
+        args.append("-i")
+    if workdir:
+        args.extend(["-w", workdir])
+    for e in (env or []):
+        args.extend(["-e", e] if "=" in e and not e.startswith("-") else [e])
+    if interactive:
+        args.extend(TERM_ENV)
+    args.extend([name, "--", "bash", "-lc", script])
+    cmd = vc_args(cfg, "exec", *args)
+    if capture:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if check and p.returncode != 0:
+            sys.stderr.write((p.stdout + p.stderr)[-3000:])
+            die(f"sandbox command failed (exit {p.returncode})")
+        return p
+    rc = subprocess.call(cmd)
+    if check and rc != 0:
+        die(f"sandbox command failed (exit {rc})")
+    return rc
+
+
+def parse_flag(args, name, has_value=False):
+    out = []
+    val = None
+    found = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--":
+            out.extend(args[i:])
+            break
+        if args[i] == name:
+            found = True
+            if has_value:
+                if i + 1 >= len(args):
+                    die(f"{name} requires a value", 2)
+                val = args[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return (val if has_value else found), out
+
+
+def parse_multi_flag(args, name):
+    out = []
+    vals = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--":
+            out.extend(args[i:])
+            break
+        if args[i] == name:
+            if i + 1 >= len(args):
+                die(f"{name} requires a value", 2)
+            vals.append(args[i + 1])
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return vals, out
+
+
+def split_passthrough(args):
+    if "--" in args:
+        idx = args.index("--")
+        return args[:idx], args[idx + 1:]
+    return args, []
+
+
+def sanitize_fx_settings(raw_text):
+    data = json.loads(raw_text)
+    data.pop("workspaces", None)
+    data["sandbox"] = "none"
+    return json.dumps(data, indent=2) + "\n"
+
+
+def filter_mcp_json(raw_text, allowed_servers=None):
+    mcp_data = json.loads(raw_text)
+    servers = mcp_data.get("mcp") or {}
+    allow = set(allowed_servers) if allowed_servers is not None else None
+    http_only = {
+        k: v for k, v in servers.items()
+        if isinstance(v, dict)
+        and v.get("type") == "http"
+        and (allow is None or k in allow)
+    }
+    if not http_only:
+        return None
+    return json.dumps({"mcp": http_only}, indent=2) + "\n"
+
+
+def add_skills_tree(tar, src_root, arc_prefix):
+    if not src_root.is_dir():
+        return
+    for entry in sorted(src_root.iterdir()):
+        if entry.name in SKILL_SKIP:
+            continue
+        resolved_dir = entry.resolve() if entry.is_symlink() else entry
+        if not resolved_dir.is_dir() or not (resolved_dir / "SKILL.md").is_file():
+            continue
+        for dirpath, dirnames, filenames in os.walk(resolved_dir, followlinks=True):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKILL_SKIP)
+            for fn in sorted(filenames):
+                if fn in SKILL_SKIP:
+                    continue
+                fp = Path(dirpath) / fn
+                if not fp.is_file():
+                    continue
+                rel = fp.relative_to(resolved_dir)
+                arc = f"{arc_prefix}/{entry.name}/{rel.as_posix()}"
+                raw = fp.read_bytes()
+                ti = tarfile.TarInfo(arc)
+                ti.size = len(raw)
+                ti.mode = fp.stat().st_mode & 0o755 | 0o644
+                tar.addfile(ti, io.BytesIO(raw))
+
+
+def build_profile_bundle(tmp_dir, cfg):
+    """Package user agent configs, themes, instruction files, and HTTP MCP config."""
+    tgz = Path(tmp_dir) / "fxs-profile.tgz"
+    h = hashlib.sha256()
+
+    def add_bytes(arc, raw_bytes, mode=0o644):
+        h.update(arc.encode() + b"\0" + raw_bytes)
+        ti = tarfile.TarInfo(arc)
+        ti.size = len(raw_bytes)
+        ti.mode = mode
+        tar.addfile(ti, io.BytesIO(raw_bytes))
+
+    with tarfile.open(tgz, "w:gz") as tar:
+        fx_dir = HOME / ".fx"
+        if (fx_dir / "settings.json").is_file():
+            try:
+                add_bytes(".fx/settings.json", sanitize_fx_settings((fx_dir / "settings.json").read_text()).encode(), 0o600)
+            except Exception:
+                pass
+        if (fx_dir / "themes").is_dir():
+            for p in sorted((fx_dir / "themes").iterdir()):
+                if p.is_file():
+                    add_bytes(f".fx/themes/{p.name}", p.read_bytes(), 0o644)
+        if (fx_dir / "AGENTS.md").is_file():
+            add_bytes(".fx/AGENTS.md", (fx_dir / "AGENTS.md").read_bytes(), 0o644)
+        mcp_servers = cfg.get("mcp_servers")
+        if mcp_servers != [] and (fx_dir / "mcp.json").is_file():
+            try:
+                filtered = filter_mcp_json((fx_dir / "mcp.json").read_text(), mcp_servers)
+                if filtered:
+                    add_bytes(".fx/mcp.json", filtered.encode(), 0o600)
+            except Exception:
+                pass
+
+        for src_rel in (".claude/settings.json", ".claude/CLAUDE.md", ".codex/config.toml", ".codex/AGENTS.md"):
+            p = HOME / src_rel
+            if p.is_file():
+                add_bytes(src_rel, p.read_bytes(), 0o600 if src_rel.endswith(".json") else 0o644)
+
+        opencode_cfg = HOME / ".config" / "opencode"
+        if opencode_cfg.is_dir():
+            for p in sorted(opencode_cfg.rglob("*")):
+                if p.is_file() and not any(part in SKILL_SKIP for part in p.parts) and p.name != "skills":
+                    if "skills" in p.relative_to(opencode_cfg).parts:
+                        continue
+                    add_bytes(p.relative_to(HOME).as_posix(), p.read_bytes(), 0o644)
+
+    return tgz, h.hexdigest()[:16]
+
+
+def build_skills_bundle(tmp_dir):
+    tgz = Path(tmp_dir) / "fxs-skills.tgz"
+    with tarfile.open(tgz, "w:gz") as tar:
+        for root_rel in (".fx/skills", ".agents/skills", ".claude/skills", ".codex/skills", ".config/opencode/skills"):
+            add_skills_tree(tar, HOME / root_rel, root_rel)
+    return tgz
+
+
+def local_git_identity():
+    name = subprocess.run(["git", "config", "--global", "user.name"], capture_output=True, text=True).stdout.strip()
+    email = subprocess.run(["git", "config", "--global", "user.email"], capture_output=True, text=True).stdout.strip()
+    return name, email
+
+
+def sandbox_exists(cfg, name):
+    p = subprocess.run(vc_args(cfg, "ls", "--name-prefix", name), capture_output=True, text=True)
+    if p.returncode != 0:
+        return False
+    return any(line.split()[:1] == [name] for line in p.stdout.splitlines())
+
+
+def export_creds_from(cfg, src_sandbox, tmp_dir):
+    if not src_sandbox or not sandbox_exists(cfg, src_sandbox):
+        return None
+    say(f"carrying over CLI logins from {src_sandbox}")
+    p = subprocess.run(
+        vc_args(
+            cfg, "exec", src_sandbox, "--", "bash", "-lc",
+            "cd ~ && files=(); "
+            "for f in .fx/auth.json .claude/.credentials.json .claude.json .codex/auth.json "
+            ".config/gh/hosts.yml .config/gh/config.yml; do "
+            "  [ -f \"$f\" ] && files+=(\"$f\"); "
+            "done; "
+            "[ ${#files[@]} -gt 0 ] && tar -czf /tmp/fxs-creds.tgz \"${files[@]}\" && echo OK",
+        ),
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0 or "OK" not in p.stdout:
+        return None
+    local_tgz = Path(tmp_dir) / "fxs-creds.tgz"
+    cp = subprocess.run(
+        vc_args(cfg, "copy", f"{src_sandbox}:/tmp/fxs-creds.tgz", str(local_tgz)),
+        capture_output=True, text=True,
+    )
+    subprocess.run(vc_args(cfg, "exec", src_sandbox, "--", "rm", "-f", "/tmp/fxs-creds.tgz"), capture_output=True)
+    return local_tgz if cp.returncode == 0 and local_tgz.exists() else None
+
+
+def vercel_logged_in():
+    p = subprocess.run(["vercel", "whoami"], capture_output=True, text=True)
+    return p.returncode == 0, p.stdout.strip()
+
+
+def discover_teams():
+    p = subprocess.run(["vercel", "teams", "ls"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return []
+    teams = []
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("id ") or line.startswith("-"):
+            continue
+        parts = line.split()
+        if parts and parts[0] not in ("id", "Team"):
+            teams.append(parts[0])
+    return teams
+
+
+def discover_projects(team):
+    cmd = ["vercel", "projects", "ls"] + (["--scope", team] if team else [])
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        return []
+    projects = []
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith(">") or s.startswith("Project Name") or s.startswith("Next page") or s.startswith("All pages") or s.startswith("vercel "):
+            continue
+        col = line.split("\t")[0].strip()
+        if col:
+            projects.append(col)
+    return projects
+
+
+def prompt_choice(label, options, default_val=None):
+    print(f"\n{label}", file=sys.stderr)
+    for idx, opt in enumerate(options, 1):
+        mark = " (default)" if opt == default_val else ""
+        print(f"  {idx}. {opt}{mark}", file=sys.stderr)
+    while True:
+        hint = f" [{default_val}]" if default_val else ""
+        raw = input(f"Select number or enter value{hint}: ").strip()
+        if not raw and default_val:
+            return default_val
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        if raw:
+            return raw
+
+
+def cmd_init(args):
+    yes, args = parse_flag(args, "--yes", has_value=False)
+    team, args = parse_flag(args, "--team", has_value=True)
+    project, args = parse_flag(args, "--project", has_value=True)
+    agent, args = parse_flag(args, "--agent", has_value=True)
+    tools_csv, args = parse_flag(args, "--tools", has_value=True)
+    vcpus, args = parse_flag(args, "--vcpus", has_value=True)
+    timeout, args = parse_flag(args, "--timeout", has_value=True)
+    idle_min, args = parse_flag(args, "--idle-minutes", has_value=True)
+    fx_channel, args = parse_flag(args, "--fx-channel", has_value=True)
+    skill_repos, args = parse_multi_flag(args, "--skill-repo")
+    warm_repos, args = parse_multi_flag(args, "--warm-repo")
+    skip_base, args = parse_flag(args, "--skip-base", has_value=False)
+    if args:
+        die(f"unknown flags for init: {' '.join(args)}", 2)
+
+    if not shutil.which("vercel"):
+        die("vercel CLI not found. Install it first (e.g. npm i -g vercel or brew install vercel-cli).")
+
+    ok, who = vercel_logged_in()
+    if not ok:
+        if yes:
+            die("vercel CLI is not signed in. Run: vercel login", 1)
+        say("vercel CLI is not signed in; starting `vercel login`")
+        subprocess.check_call(["vercel", "login"])
+        ok, who = vercel_logged_in()
+    say(f"signed in to Vercel as {who}")
+
+    old = read_config()
+    if not team:
+        teams = discover_teams()
+        if yes:
+            team = old.get("team") or (teams[0] if teams else die("pass --team <team>", 2))
+        elif teams:
+            team = prompt_choice("Choose your Vercel team/scope for sandboxes:", teams, old.get("team") or teams[0])
+        else:
+            team = input(f"Vercel team/scope [{old.get('team', '')}]: ").strip() or old.get("team", "")
+    if not team:
+        die("a Vercel team/scope is required", 2)
+
+    if not project:
+        projects = discover_projects(team)
+        default_proj = old.get("project") or ("vercel-sandbox-default-project" if "vercel-sandbox-default-project" in projects else (projects[0] if projects else None))
+        if yes:
+            project = default_proj or die("pass --project <project>", 2)
+        elif projects:
+            project = prompt_choice(f"Choose a Vercel project under '{team}':", projects[:20], default_proj)
+        else:
+            project = input(f"Vercel project [{default_proj or ''}]: ").strip() or (default_proj or "")
+    if not project:
+        die("a Vercel project is required", 2)
+
+    shims = all_shims()
+    if not agent:
+        default_agent = old.get("default_agent", "fx")
+        agent = default_agent if yes else prompt_choice(
+            "Choose your default coding agent:",
+            sorted(shims.keys()),
+            default_agent,
+        )
+    if agent not in shims:
+        die(f"unknown agent '{agent}'", 2)
+
+    if tools_csv is not None:
+        tools = [t.strip() for t in tools_csv.split(",") if t.strip()]
+    elif yes:
+        tools = old.get("tools", ["gh", "node"])
+    else:
+        default_tools = ",".join(old.get("tools", ["gh", "node"]))
+        raw_tools = input(f"Optional toolchains to preinstall (comma-separated from: gh,node,bun,zig,python) [{default_tools}]: ").strip()
+        tools = [t.strip() for t in (raw_tools or default_tools).split(",") if t.strip()]
+
+    cfg = {
+        "team": team,
+        "project": project,
+        "default_agent": agent,
+        "agents": sorted(set([agent, *(old.get("agents") or [])])),
+        "vcpus": vcpus or old.get("vcpus", "8"),
+        "timeout": timeout or old.get("timeout", "6h"),
+        "idle_minutes": int(idle_min) if idle_min is not None else old.get("idle_minutes", 30),
+        "tools": tools,
+        "fx_channel": fx_channel or old.get("fx_channel", "stable"),
+        "skill_repos": skill_repos or old.get("skill_repos", []),
+        "warm_repos": warm_repos or old.get("warm_repos", []),
+        "mcp_servers": old.get("mcp_servers", None),
+    }
+    write_json(CONFIG_FILE, cfg)
+    say(f"saved config to {CONFIG_FILE}")
+
+    if not skip_base:
+        cmd_base([])
+
+
+def build_base_setup_script(cfg, agents_to_install):
+    tools = set(cfg.get("tools") or [])
+    shims = all_shims(cfg)
+    selected = [shims[a] for a in agents_to_install if a in shims]
+    git_name, git_email = local_git_identity()
+
+    lines = [
+        "set -euo pipefail",
+        'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"',
+        "log() { printf '[fxs-base] %s\\n' \"$*\"; }",
+        'mkdir -p -m 700 "$HOME/.fx" "$HOME/.fx/themes" "$HOME/.fx/skills" "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.config/opencode/skills"',
+        'if [ -f /tmp/fxs-skills.tgz ]; then tar -xzf /tmp/fxs-skills.tgz -C "$HOME" && rm -f /tmp/fxs-skills.tgz; fi',
+        'if [ -f /tmp/fxs-profile.tgz ]; then tar -xzf /tmp/fxs-profile.tgz -C "$HOME" && rm -f /tmp/fxs-profile.tgz; fi',
+        'if [ -f /tmp/fxs-creds.tgz ]; then (umask 077 && tar -xzf /tmp/fxs-creds.tgz -C "$HOME") && rm -f /tmp/fxs-creds.tgz; fi',
+        "missing=()",
+        "for cmd in git rg jq curl unzip dtach; do command -v \"$cmd\" >/dev/null 2>&1 || missing+=(\"$cmd\"); done",
+        "command -v xz >/dev/null 2>&1 || missing+=(xz-utils)",
+    ]
+    if "gh" in tools:
+        lines.append("command -v gh >/dev/null 2>&1 || missing+=(gh)")
+    if "zsh" in tools:
+        lines.append("command -v zsh >/dev/null 2>&1 || missing+=(zsh)")
+    if "fish" in tools:
+        lines.append("command -v fish >/dev/null 2>&1 || missing+=(fish)")
+    lines.extend([
+        'if [ "${#missing[@]}" -gt 0 ]; then',
+        "  pkgs=(); for m in \"${missing[@]}\"; do [ \"$m\" = \"rg\" ] && pkgs+=(ripgrep) || pkgs+=(\"$m\"); done",
+        '  log "installing packages: ${pkgs[*]}"',
+        "  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq",
+        '  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null',
+        "fi",
+        'if [ -f /etc/zsh/zshenv ] && ! grep -qs skip_global_compinit /etc/zsh/zshenv; then echo "skip_global_compinit=1" | sudo tee -a /etc/zsh/zshenv >/dev/null; fi',
+    ])
+
+    if "zig" in tools:
+        lines.append(f'''
+if [ "$(zig version 2>/dev/null || true)" != "{ZIG_VERSION}" ]; then
+  arch="$(uname -m)"
+  read -r url sha < <(curl -fsSL https://ziglang.org/download/index.json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)[sys.argv[1]][sys.argv[2] + "-linux"]
+print(d["tarball"], d["shasum"])' "{ZIG_VERSION}" "$arch")
+  log "installing zig {ZIG_VERSION}"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/zig.tar.xz" "$url"
+  echo "$sha  $tmp/zig.tar.xz" | sha256sum -c --quiet -
+  sudo mkdir -p /opt/zig
+  sudo tar -xJf "$tmp/zig.tar.xz" -C /opt/zig
+  dir="$(basename "$url" .tar.xz)"
+  sudo ln -sfn "/opt/zig/$dir/zig" /usr/local/bin/zig
+  rm -rf "$tmp"
+fi
+'''.strip())
+
+    if "bun" in tools:
+        lines.append(f'''
+if [ "$(bun --version 2>/dev/null || true)" != "{BUN_VERSION}" ]; then
+  log "installing bun {BUN_VERSION}"
+  curl -fsSL https://bun.sh/install | bash -s "bun-v{BUN_VERSION}" >/dev/null 2>&1
+  sudo ln -sfn "$HOME/.bun/bin/bun" /usr/local/bin/bun
+fi
+'''.strip())
+
+    for shim in selected:
+        lines.append(f'log "installing agent: {shim.name}"')
+        lines.append(shim.install_cmd)
+
+    if git_name:
+        lines.append(f"git config --global user.name {shlex.quote(git_name)}")
+    if git_email:
+        lines.append(f"git config --global user.email {shlex.quote(git_email)}")
+    lines.append("git config --global init.defaultBranch main")
+    lines.append("git config --global push.autoSetupRemote true")
+
+    for shim in selected:
+        lines.append(
+            f'if ! ({shim.auth_check_cmd}); then '
+            f'if [ -t 0 ]; then log "signing in to {shim.name}"; {shim.auth_login_cmd}; '
+            f'else log "note: {shim.name} is not signed in yet; sign in on first run or pass API key env"; fi; fi'
+        )
+    if "gh" in tools:
+        lines.append(
+            'if ! gh auth status >/dev/null 2>&1; then '
+            'if [ -t 0 ]; then log "signing in to GitHub"; BROWSER=echo gh auth login --hostname github.com --git-protocol https --web --scopes repo,read:org,workflow; '
+            'else log "note: gh is not signed in yet"; fi; fi; '
+            'gh auth setup-git --hostname github.com || true'
+        )
+
+    for repo in (cfg.get("skill_repos") or []):
+        url = repo if "://" in repo or repo.startswith("git@") else f"https://github.com/{repo}.git"
+        rname = Path(url.rstrip("/")).stem
+        target_skills = selected[0].skills_dir if selected else ".fx/skills"
+        lines.append(f'''
+log "installing skills from {repo}"
+sdir="$HOME/.cache/fxs-skill-repos/{rname}"
+rm -rf "$sdir"
+GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet {shlex.quote(url)} "$sdir" || true
+if [ -d "$sdir" ]; then
+  find "$sdir" -maxdepth 4 -name SKILL.md -type f | while read -r sm; do
+    d="$(dirname "$sm")"
+    bn="$(basename "$d")"
+    dst="$HOME/{target_skills}/$bn"
+    rm -rf "$dst" && cp -a "$d" "$dst"
+  done
+fi
+'''.strip())
+
+    for repo in (cfg.get("warm_repos") or []):
+        url = repo if "://" in repo or repo.startswith("git@") else f"https://github.com/{repo}.git"
+        rname = Path(url.rstrip("/")).stem
+        lines.append(f'''
+log "warming caches for {repo}"
+wdir="$HOME/workspaces/{rname}"
+mkdir -p "$HOME/workspaces"
+if [ ! -d "$wdir/.git" ]; then
+  GIT_TERMINAL_PROMPT=0 git clone --quiet {shlex.quote(url)} "$wdir" || true
+fi
+if [ -d "$wdir" ]; then
+  (
+    cd "$wdir"
+    if [ -f build.zig ] && command -v zig >/dev/null 2>&1; then
+      zig build || true
+      if [ -f build.zig.zon ] && [ -d .zig-cache ]; then
+        seeds="$HOME/.cache/fxs-zig-seed/{rname}"
+        mkdir -p "$seeds" .zig-cache/tmp
+        cp -a --reflink=auto .zig-cache "$seeds/cache"
+        fp="$(grep -o -E '\\.fingerprint *= *0x[0-9a-fA-F]+' build.zig.zon | grep -o -E '0x[0-9a-fA-F]+' | tr 'A-F' 'a-f' || true)"
+        cpu="$(cd /tmp && zig build-exe --show-builtin 2>/dev/null | grep -m1 -o 'cpu\\.[a-z0-9_]*' | cut -d. -f2 || true)"
+        printf '{{"fingerprint":"%s","commit":"%s","cpus":["%s"]}}\\n' "$fp" "$(git rev-parse --short HEAD 2>/dev/null || echo head)" "$cpu" > "$seeds/meta.json"
+      fi
+    fi
+    if [ -f package.json ]; then
+      if command -v bun >/dev/null 2>&1; then bun install || true
+      elif command -v npm >/dev/null 2>&1; then npm install || true; fi
+    fi
+  )
+fi
+'''.strip())
+
+    return "\n".join(lines) + "\n"
+
+
+def cmd_base(args):
+    cfg = require_config()
+    from_sb, args = parse_flag(args, "--from", has_value=True)
+    no_warm, args = parse_flag(args, "--no-warm", has_value=False)
+    agents_csv, args = parse_flag(args, "--agents", has_value=True)
+    if args:
+        die(f"unknown flags for base: {' '.join(args)}", 2)
+
+    agents = [a.strip() for a in agents_csv.split(",") if a.strip()] if agents_csv else (cfg.get("agents") or [cfg.get("default_agent", "fx")])
+    if no_warm:
+        cfg = {**cfg, "warm_repos": []}
+
+    with file_lock(CACHE_DIR / "base.lock"):
+        old = read_json(BASE_FILE, None)
+        temp_cred_sb = None
+        if not from_sb and old and old.get("snapshot") and old.get("team") == cfg["team"] and old.get("project") == cfg["project"]:
+            temp_cred_sb = "fxs-cred-" + uuid.uuid4().hex[:6]
+            say(f"carrying over logins from previous base {old['snapshot']}")
+            rc = subprocess.call(
+                vc_args(cfg, "create", "--name", temp_cred_sb, "--snapshot", old["snapshot"], "--vcpus", "2", "--timeout", "5m"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if rc == 0:
+                from_sb = temp_cred_sb
+            else:
+                temp_cred_sb = None
+
+        base_name = "fxs-base-" + uuid.uuid4().hex[:6]
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_tgz, profile_hash = build_profile_bundle(tmp, cfg)
+            skills_tgz = build_skills_bundle(tmp)
+            creds_tgz = export_creds_from(cfg, from_sb, tmp) if from_sb else None
+            if temp_cred_sb:
+                subprocess.run(vc_args(cfg, "rm", temp_cred_sb), capture_output=True)
+
+            say(f"creating base sandbox {base_name} in {cfg['team']}/{cfg['project']}")
+            run_vc(cfg, "create", "--name", base_name, "--vcpus", str(cfg.get("vcpus", "8")), "--timeout", "1h", "--tag", "fxs=base")
+            run_vc(cfg, "copy", str(profile_tgz), f"{base_name}:/tmp/fxs-profile.tgz", capture=True)
+            run_vc(cfg, "copy", str(skills_tgz), f"{base_name}:/tmp/fxs-skills.tgz", capture=True)
+            if creds_tgz:
+                run_vc(cfg, "copy", str(creds_tgz), f"{base_name}:/tmp/fxs-creds.tgz", capture=True)
+
+        script = build_base_setup_script(cfg, agents)
+        remote_exec(cfg, base_name, script, interactive=sys.stdin.isatty())
+
+        say("snapshotting base image")
+        p = run_vc(cfg, "snapshot", "--stop", "--expiration", "0", base_name, capture=True)
+        m = re.search(r"snap_[A-Za-z0-9]+", p.stdout + p.stderr)
+        if not m:
+            die("could not find snapshot ID in output")
+        snap_id = m.group(0)
+        subprocess.run(vc_args(cfg, "rm", base_name), capture_output=True)
+
+        write_json(BASE_FILE, {
+            "snapshot": snap_id,
+            "created": time.time(),
+            "profile_hash": profile_hash,
+            "team": cfg["team"],
+            "project": cfg["project"],
+            "agents": agents,
+        })
+        say(f"base snapshot {snap_id} is ready")
+
+
+def ensure_base(cfg):
+    base = read_json(BASE_FILE, None)
+    if not base or base.get("team") != cfg["team"] or base.get("project") != cfg["project"]:
+        say("no base snapshot found yet; building one now")
+        cmd_base([])
+        base = read_json(BASE_FILE, None)
+    return base
+
+
+def sync_profile_if_needed(cfg, name, base_hash):
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_tgz, current_hash = build_profile_bundle(tmp, cfg)
+        if current_hash == base_hash:
+            return
+        say("syncing updated local agent config/theme")
+        run_vc(cfg, "copy", str(profile_tgz), f"{name}:/tmp/fxs-profile.tgz", capture=True)
+        remote_exec(cfg, name, "tar -xzf /tmp/fxs-profile.tgz -C ~ && rm -f /tmp/fxs-profile.tgz", capture=True)
+
+
+def rename_rex_block(label):
+    block = os.environ.get("REX_BLOCK")
+    if not block or not shutil.which("rex"):
+        return
+    subprocess.run(["rex", "block", "rename", block, label], capture_output=True)
+
+
+REMOTE_PACK_FX_SESSIONS_PY = r'''
+import json, os, re, tarfile
+
+root = os.path.expanduser("~/.fx/sessions/v2")
+out_tgz = "/tmp/fxs-sessions.tgz"
+if not os.path.isdir(root):
+    print(json.dumps({"roots": [], "count": 0}))
+    raise SystemExit(0)
+
+titles = {}
+idx = os.path.join(root, "index.jsonl")
+if os.path.isfile(idx):
+    with open(idx, "r", errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            sid = d.get("id")
+            if not sid:
+                continue
+            if d.get("op") == "rm":
+                titles.pop(sid, None)
+            elif d.get("op") == "put":
+                titles[sid] = d
+
+id_re = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+roots = []
+count = 0
+with tarfile.open(out_tgz, "w:gz") as tar:
+    for name in sorted(os.listdir(root)):
+        if not id_re.match(name):
+            continue
+        sdir = os.path.join(root, name)
+        logp = os.path.join(sdir, "log.jsonl")
+        if not os.path.isdir(sdir) or not os.path.isfile(logp):
+            continue
+        count += 1
+        tar.add(logp, arcname=f"{name}/log.jsonl")
+        bdir = os.path.join(sdir, "blobs")
+        if os.path.isdir(bdir):
+            for b in os.listdir(bdir):
+                bp = os.path.join(bdir, b)
+                if os.path.isfile(bp) and re.fullmatch(r"[A-Za-z0-9_-]+", b):
+                    tar.add(bp, arcname=f"{name}/blobs/{b}")
+        info = titles.get(name, {})
+        if info.get("role", "root") == "root":
+            roots.append({
+                "id": name,
+                "title": info.get("title") or "(untitled)",
+                "turns": info.get("turns", 0),
+                "updated": info.get("updated", 0),
+            })
+
+roots.sort(key=lambda r: r.get("updated", 0), reverse=True)
+print(json.dumps({"roots": roots, "count": count}))
+'''
+
+REMOTE_LIST_FILES_PY = r'''
+import json, os, subprocess
+
+home = os.path.expanduser("~")
+skip_top = {"workspaces"}
+skip_walk = {
+    ".git", "node_modules", ".zig-cache", "zig-out", "__pycache__",
+    ".venv", "venv", ".next", ".turbo", "target", ".DS_Store",
+}
+
+files = []
+top_entries = []
+
+def dir_size(path):
+    total = 0
+    count = 0
+    for dp, dns, fns in os.walk(path):
+        dns[:] = [d for d in dns if d not in skip_walk]
+        for fn in fns:
+            if fn in skip_walk:
+                continue
+            fp = os.path.join(dp, fn)
+            if not os.path.islink(fp):
+                try:
+                    total += os.path.getsize(fp)
+                    count += 1
+                except OSError:
+                    pass
+    return count, total
+
+for name in sorted(os.listdir(home)):
+    if name in skip_top or name.startswith("."):
+        continue
+    full = os.path.join(home, name)
+    if os.path.islink(full):
+        continue
+    if os.path.isfile(full):
+        sz = os.path.getsize(full)
+        item = {"path": name, "size": sz, "kind": "file"}
+        files.append(item)
+        top_entries.append(item)
+    elif os.path.isdir(full):
+        cnt, sz = dir_size(full)
+        note = ""
+        if os.path.isdir(os.path.join(full, ".git")):
+            gp = subprocess.run(["git", "-C", full, "status", "--porcelain"], capture_output=True, text=True)
+            dirty = len(gp.stdout.splitlines())
+            note = f"{cnt} files, {dirty} changed" if dirty else f"{cnt} files"
+        else:
+            note = f"{cnt} files"
+        top_entries.append({"path": name, "size": sz, "kind": "dir", "note": note})
+        for dp, dns, fns in os.walk(full):
+            dns[:] = [d for d in dns if d not in skip_walk]
+            for fn in sorted(fns):
+                if fn in skip_walk:
+                    continue
+                fp = os.path.join(dp, fn)
+                if not os.path.islink(fp):
+                    rel = os.path.relpath(fp, home)
+                    try:
+                        files.append({"path": rel, "size": os.path.getsize(fp), "kind": "file"})
+                    except OSError:
+                        pass
+
+items = files if len(files) <= 30 else top_entries
+print(json.dumps({"items": items, "grouped": len(files) > 30}))
+'''
+
+REMOTE_PROBE_ACTIVITY_PY = r'''
+import glob, json, os, subprocess, sys
+
+agent = sys.argv[1] if len(sys.argv) > 1 else "fx"
+working = False
+sid = None
+title = None
+max_mtime = 0.0
+
+if agent == "fx":
+    fx_bin = os.path.expanduser("~/.local/bin/fx")
+    p = subprocess.run([fx_bin, "sessions", "--live", "--all", "--json"], capture_output=True, text=True)
+    sessions = []
+    try:
+        sessions = json.loads(p.stdout).get("sessions", [])
+    except Exception:
+        sessions = []
+
+    def any_working(nodes):
+        for n in nodes:
+            if n.get("state") == "working":
+                return True
+            if any_working(n.get("agents") or []):
+                return True
+        return False
+
+    working = any_working(sessions)
+    sid = sessions[0].get("id") if sessions else None
+    title = sessions[0].get("title") if sessions else None
+    globs = [os.path.expanduser("~/.fx/sessions/v2/*/log.jsonl")]
+    proc_pat = "/.local/bin/fx"
+elif agent == "claude":
+    globs = [os.path.expanduser("~/.claude/projects/*/*.jsonl")]
+    proc_pat = "claude"
+elif agent == "codex":
+    globs = [os.path.expanduser("~/.codex/sessions/**/*.jsonl")]
+    proc_pat = "codex"
+else:
+    globs = [os.path.expanduser("~/.local/share/opencode/**/*")]
+    proc_pat = agent
+
+pg = subprocess.run(["pgrep", "-f", proc_pat], capture_output=True, text=True)
+pids = [x.strip() for x in pg.stdout.splitlines() if x.strip().isdigit()]
+has_children = False
+for pid in pids:
+    ch = subprocess.run(["pgrep", "-P", pid], capture_output=True, text=True)
+    if ch.stdout.strip():
+        has_children = True
+        break
+
+for g in globs:
+    for lp in glob.glob(g, recursive=True):
+        try:
+            max_mtime = max(max_mtime, os.path.getmtime(lp))
+        except OSError:
+            pass
+
+print(json.dumps({
+    "agent_alive": len(pids) > 0,
+    "working": working or has_children,
+    "session_id": sid,
+    "title": title,
+    "last_log_mtime": max_mtime,
+    "pids": pids,
+}))
+'''
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def sync_sessions_back(cfg, name, agent_name="fx"):
+    if agent_name != "fx":
+        return []
+    p = remote_exec(
+        cfg, name,
+        f"python3 -c {shlex.quote(REMOTE_PACK_FX_SESSIONS_PY)}",
+        check=False, capture=True,
+    )
+    if p.returncode != 0:
+        return []
+    try:
+        info = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return []
+    if info.get("count", 0) == 0:
+        subprocess.run(vc_args(cfg, "exec", name, "--", "rm", "-f", "/tmp/fxs-sessions.tgz"), capture_output=True)
+        return []
+
+    local_sessions_dir = Path(os.environ.get("FX_HOME", str(HOME / ".fx"))) / "sessions" / "v2"
+    local_sessions_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        local_tgz = Path(tmp) / "fxs-sessions.tgz"
+        cp = subprocess.run(vc_args(cfg, "copy", f"{name}:/tmp/fxs-sessions.tgz", str(local_tgz)), capture_output=True, text=True)
+        subprocess.run(vc_args(cfg, "exec", name, "--", "rm", "-f", "/tmp/fxs-sessions.tgz"), capture_output=True)
+        if cp.returncode != 0 or not local_tgz.exists():
+            return []
+        root_real = os.path.realpath(local_sessions_dir)
+        with tarfile.open(local_tgz, "r:gz") as tar:
+            for m in tar.getmembers():
+                if not m.isreg() or not SESSION_MEMBER_RE.fullmatch(m.name):
+                    continue
+                target = os.path.realpath(os.path.join(root_real, m.name))
+                if not target.startswith(root_real + os.sep):
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with tar.extractfile(m) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(target, 0o600)
+
+    roots = info.get("roots", [])
+    if roots:
+        saved = read_json(SESSIONS_INDEX, [])
+        by_id = {r["id"]: r for r in saved if isinstance(r, dict) and "id" in r}
+        now = time.time()
+        for r in roots:
+            by_id[r["id"]] = {
+                "id": r["id"],
+                "title": r["title"],
+                "turns": r["turns"],
+                "sandbox": name,
+                "agent": agent_name,
+                "saved_at": now,
+            }
+        merged = sorted(by_id.values(), key=lambda r: r.get("saved_at", 0), reverse=True)[:200]
+        write_json(SESSIONS_INDEX, merged)
+        for r in roots:
+            say(f"saved session {r['id']} ({r['title']}, {r['turns']} turns) -> resume locally: fx -r {r['id']}")
+    return roots
+
+
+def list_sandbox_files(cfg, name):
+    p = remote_exec(cfg, name, f"python3 -c {shlex.quote(REMOTE_LIST_FILES_PY)}", check=False, capture=True)
+    if p.returncode != 0:
+        return []
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1]).get("items", [])
+    except Exception:
+        return []
+
+
+def extract_sandbox_paths(cfg, name, selected, dest):
+    dest = Path(dest).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    quoted = " ".join(shlex.quote(s) for s in selected)
+    tar_script = (
+        f"cd ~ && tar --exclude=.zig-cache --exclude=node_modules --exclude=__pycache__ "
+        f"--exclude=zig-out -czf /tmp/fxs-pull.tgz {quoted}"
+    )
+    remote_exec(cfg, name, tar_script, capture=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        local_tgz = Path(tmp) / "fxs-pull.tgz"
+        run_vc(cfg, "copy", f"{name}:/tmp/fxs-pull.tgz", str(local_tgz), capture=True)
+        subprocess.run(vc_args(cfg, "exec", name, "--", "rm", "-f", "/tmp/fxs-pull.tgz"), capture_output=True)
+        dest_real = os.path.realpath(dest)
+        count = 0
+        with tarfile.open(local_tgz, "r:gz") as tar:
+            for m in tar.getmembers():
+                target = os.path.realpath(os.path.join(dest_real, m.name))
+                if not (target == dest_real or target.startswith(dest_real + os.sep)):
+                    continue
+                if m.isdir():
+                    os.makedirs(target, exist_ok=True)
+                elif m.isreg():
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with tar.extractfile(m) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.chmod(target, m.mode & 0o755 | 0o600)
+                    count += 1
+        say(f"copied {count} file(s) to {dest}")
+        return count
+
+
+def prompt_keep_files(cfg, name):
+    items = list_sandbox_files(cfg, name)
+    if not items:
+        return
+    print(file=sys.stderr)
+    say(f"other files in {name}:")
+    for idx, item in enumerate(items, 1):
+        extra = f" ({item['note']}, {fmt_bytes(item['size'])})" if item.get("note") else f" ({fmt_bytes(item['size'])})"
+        print(f"  {idx}. {item['path']}{extra}", file=sys.stderr)
+
+    try:
+        choice = input("Keep files locally? [a]ll, [p]ick numbers (e.g. 1,3), [n]one (default: n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return
+    if not choice or choice in ("n", "no", "none"):
+        return
+
+    selected = []
+    if choice in ("a", "all"):
+        selected = [it["path"] for it in items]
+    else:
+        raw = choice
+        if choice in ("p", "pick"):
+            try:
+                raw = input("Enter numbers (comma or space separated): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                return
+        for tok in re.split(r"[\s,]+", raw):
+            if tok.isdigit() and 1 <= int(tok) <= len(items):
+                selected.append(items[int(tok) - 1]["path"])
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        say("no valid items selected; skipping")
+        return
+
+    default_dest = PULL_DEFAULT_ROOT / name
+    try:
+        dest_in = input(f"Copy to folder [{default_dest}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return
+    dest = Path(os.path.expanduser(dest_in)).resolve() if dest_in else default_dest
+    extract_sandbox_paths(cfg, name, selected, dest)
+
+
+def read_sandboxes():
+    data = read_json(SANDBOXES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def update_sandbox_record(name, **fields):
+    with file_lock(CACHE_DIR / "sandboxes.lock"):
+        data = read_sandboxes()
+        rec = data.get(name, {})
+        rec.update(fields)
+        data[name] = rec
+        write_json(SANDBOXES_FILE, data)
+
+
+def watchdog_running():
+    if not WATCHDOG_PID_FILE.exists():
+        return None
+    try:
+        pid = int(WATCHDOG_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def ensure_watchdog(cfg):
+    idle_min = int(os.environ.get("FXS_IDLE_MINUTES", str(cfg.get("idle_minutes", 30))))
+    if idle_min <= 0 or watchdog_running():
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    log_f = open(WATCHDOG_LOG_FILE, "a")
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "watchdog", "__run"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_f.close()
+
+
+def parse_timeout_left_s(line):
+    m = re.search(r"\bin\s+(\d+)\s+(second|minute|hour|day)s?\b", line)
+    if not m:
+        return None
+    n = int(m.group(1))
+    mult = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}[m.group(2)]
+    return n * mult
+
+
+def run_watchdog_daemon():
+    cfg = read_config()
+    idle_min = max(0, int(os.environ.get("FXS_IDLE_MINUTES", str(cfg.get("idle_minutes", 30)))))
+    if idle_min <= 0 or not cfg.get("team"):
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_f = open(WATCHDOG_LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    WATCHDOG_PID_FILE.write_text(str(os.getpid()) + "\n")
+    try:
+        while True:
+            time.sleep(60)
+            data = read_sandboxes()
+            managed = [n for n, r in data.items() if r.get("managed")]
+            if not managed:
+                break
+
+            p = subprocess.run(vc_args(cfg, "ls"), capture_output=True, text=True)
+            if p.returncode != 0:
+                continue
+            running_timeouts = {}
+            for line in p.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "running":
+                    running_timeouts[parts[0]] = parse_timeout_left_s(line)
+
+            now = time.time()
+            for name in managed:
+                if name not in running_timeouts:
+                    update_sandbox_record(name, managed=False)
+                    continue
+                rec = read_sandboxes().get(name, {})
+                agent_name = rec.get("agent", cfg.get("default_agent", "fx"))
+                pr = subprocess.run(
+                    vc_args(cfg, "exec", name, "--", "python3", "-c", REMOTE_PROBE_ACTIVITY_PY, agent_name),
+                    capture_output=True, text=True,
+                )
+                if pr.returncode != 0:
+                    continue
+                try:
+                    info = json.loads(pr.stdout.strip().splitlines()[-1])
+                except Exception:
+                    continue
+
+                sid = info.get("session_id") or rec.get("session_id")
+                title = info.get("title") or rec.get("title")
+                if sid:
+                    update_sandbox_record(name, session_id=sid, title=title)
+
+                last_active = float(rec.get("last_active") or now)
+                log_mtime = float(info.get("last_log_mtime") or 0.0)
+                if log_mtime > last_active:
+                    last_active = log_mtime
+                if info.get("working"):
+                    last_active = now
+                    update_sandbox_record(name, last_active=last_active)
+                    left_s = running_timeouts.get(name)
+                    if left_s is not None and left_s < 3600:
+                        subprocess.run(vc_args(cfg, "extend", name, "2h"), capture_output=True)
+                    continue
+                update_sandbox_record(name, last_active=last_active)
+
+                if now - last_active < idle_min * 60:
+                    continue
+
+                sync_sessions_back(cfg, name, agent_name)
+                if info.get("agent_alive") and info.get("pids"):
+                    pids_str = " ".join(info["pids"])
+                    subprocess.run(
+                        vc_args(cfg, "exec", name, "--", "bash", "-lc",
+                                f"kill -INT {pids_str} 2>/dev/null || true; sleep 1; "
+                                f"kill -INT {pids_str} 2>/dev/null || true; sleep 2"),
+                        capture_output=True,
+                    )
+                st = subprocess.run(vc_args(cfg, "stop", name), capture_output=True, text=True)
+                if st.returncode == 0:
+                    update_sandbox_record(name, managed=False, stopped_reason="idle", stopped_at=now)
+    finally:
+        with contextlib.suppress(OSError):
+            WATCHDOG_PID_FILE.unlink()
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        lock_f.close()
+
+
+def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resume_id=None):
+    shim = get_shim(agent_name, cfg)
+    rename_rex_block(name)
+    update_sandbox_record(name, agent=agent_name, managed=True, last_active=time.time(), stopped_reason=None)
+    ensure_watchdog(cfg)
+
+    first = True
+    exited = False
+    while True:
+        use_continue = continue_first or (not first)
+        cmd = shim.launch_command(agent_args, resume_id=resume_id if use_continue else None, continue_last=use_continue and not resume_id)
+        exports = "".join(f"export {k}={shlex.quote(str(v))}; " for k, v in shim.extra_env.items())
+        script = (
+            'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"; '
+            f'{exports}exec dtach -A /tmp/fxs-agent.sock -E -z -r winch {cmd}'
+        )
+        rc = remote_exec(cfg, name, script, interactive=True, check=False)
+        first = False
+        alive = remote_exec(
+            cfg, name,
+            "pgrep -f '/tmp/fxs-agent.sock' >/dev/null 2>&1 && echo ALIVE || echo GONE",
+            check=False, capture=True,
+        )
+        still_running = alive.returncode == 0 and "ALIVE" in alive.stdout
+        if not still_running and rc == 0:
+            exited = True
+            break
+        print(file=sys.stderr)
+        if still_running:
+            say(f"connection to {name} dropped (exit {rc}); {agent_name} keeps running in the sandbox.")
+            prompt_msg = "Press Enter to reattach, or 'q' to leave it running in the cloud: "
+        else:
+            say(f"connection/sandbox ended (exit {rc}); your files and session are saved on disk.")
+            prompt_msg = "Press Enter to resume in a new session, or 'q' to quit: "
+        try:
+            ans = input(prompt_msg).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if ans == "q":
+            if not still_running:
+                exited = True
+            break
+
+    roots = sync_sessions_back(cfg, name, agent_name)
+    if roots:
+        update_sandbox_record(name, session_id=roots[0]["id"], title=roots[0]["title"])
+    if not exited:
+        say(f"{agent_name} is still running in {name}; reattach anytime with `fxs resume {name}`")
+        return
+    update_sandbox_record(name, managed=False)
+    if sys.stdin.isatty():
+        prompt_keep_files(cfg, name)
+        try:
+            action = input(f"Sandbox {name}: [k]eep running, [s]top (pause billing), [r]emove (default: k): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            action = "k"
+        if action in ("s", "stop"):
+            run_vc(cfg, "stop", name)
+            return
+        if action in ("r", "rm", "remove"):
+            run_vc(cfg, "rm", name)
+            return
+    say(f"sandbox {name}: resume with `fxs resume {name}` | stop with `fxs stop {name}` | remove with `fxs rm {name}`")
+
+
+def cmd_new(args):
+    cfg = require_config()
+    flags, agent_args = split_passthrough(args)
+    name, flags = parse_flag(flags, "--name", has_value=True)
+    agent_name, flags = parse_flag(flags, "--agent", has_value=True)
+    do_split, flags = parse_flag(flags, "--split", has_value=False)
+    vcpus, flags = parse_flag(flags, "--vcpus", has_value=True)
+    timeout, flags = parse_flag(flags, "--timeout", has_value=True)
+    if flags:
+        die(f"unknown flags: {' '.join(flags)}", 2)
+
+    agent_name = agent_name or cfg.get("default_agent", "fx")
+    get_shim(agent_name, cfg)
+
+    if do_split:
+        return spawn_split(cfg, agent_name, agent_args)
+
+    base = ensure_base(cfg)
+    if agent_name not in (base.get("agents") or []):
+        say(f"agent '{agent_name}' is not in the current base snapshot; installing on boot (run `fxs base --agents {','.join(sorted(set((base.get('agents') or []) + [agent_name])))}` to bake it in)")
+
+    name = name or ("fxs-" + uuid.uuid4().hex[:6])
+    say(f"starting {name} ({agent_name}) from {base['snapshot']}")
+    run_vc(
+        cfg, "create",
+        "--name", name,
+        "--snapshot", base["snapshot"],
+        "--vcpus", str(vcpus or cfg.get("vcpus", "8")),
+        "--timeout", timeout or cfg.get("timeout", "6h"),
+        "--tag", "fxs=1",
+        capture=True,
+    )
+    sync_profile_if_needed(cfg, name, base.get("profile_hash"))
+    if agent_name not in (base.get("agents") or []):
+        shim = get_shim(agent_name, cfg)
+        remote_exec(cfg, name, f"set -e; {shim.install_cmd}", interactive=sys.stdin.isatty())
+    run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False)
+
+
+def rex_json(*args):
+    p = subprocess.run(["rex", *args, "--json"], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr)
+        die(f"rex {' '.join(args)} failed")
+    return json.loads(p.stdout)
+
+
+def focus_rex_session_in_app(session_id):
+    p = subprocess.run(["rex", "client", "ls", "--json"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return
+    try:
+        clients = json.loads(p.stdout).get("clients", [])
+    except Exception:
+        return
+    for c in clients:
+        if c.get("info", {}).get("kind") == "app":
+            subprocess.run(
+                ["rex", "-C", c["client_id"], "do", "session.select", f"session_id={session_id}"],
+                capture_output=True,
+            )
+            break
+
+
+def spawn_split(cfg, agent_name, agent_args):
+    if not shutil.which("rex"):
+        die("rex CLI not found")
+    session = os.environ.get("REX_SESSION")
+    block = os.environ.get("REX_BLOCK")
+    if not session or not block:
+        die("--split must be run inside a Rex pane")
+    ensure_base(cfg)
+    cmd = ["rex", "split", "-s", session, "-b", block, "--split=right", "--", str(Path(__file__).resolve()), "--agent", agent_name]
+    if agent_args:
+        cmd.extend(["--", *agent_args])
+    subprocess.check_call(cmd)
+
+
+def cmd_group(args):
+    cfg = require_config()
+    if not shutil.which("rex"):
+        die("rex CLI not found")
+    flags, agent_args = split_passthrough(args)
+    ws_label, flags = parse_flag(flags, "--workspace", has_value=True)
+    new_ws, flags = parse_flag(flags, "-w", has_value=False)
+    agent_name, flags = parse_flag(flags, "--agent", has_value=True)
+    if len(flags) != 1 or not flags[0].isdigit() or int(flags[0]) < 1:
+        die("usage: fxs group <count> [--workspace LABEL] [--agent NAME] [-- <args...>]", 2)
+    count = int(flags[0])
+    agent_name = agent_name or cfg.get("default_agent", "fx")
+    get_shim(agent_name, cfg)
+    ensure_base(cfg)
+
+    child_cmd = [str(Path(__file__).resolve()), "--agent", agent_name] + (["--", *agent_args] if agent_args else [])
+    session = os.environ.get("REX_SESSION")
+    if ws_label or new_ws or not session:
+        res = rex_json("new", ws_label or "fxs", "--window", "sandboxes", "--", *child_cmd)
+        session = res["session_id"]
+        first_block = res["initial_windows"][0]["block_ids"][0]
+        focus_rex_session_in_app(session)
+    else:
+        res = rex_json("window", "new", "-s", session, "sandboxes", "--", *child_cmd)
+        first_block = res["block_ids"][0]
+
+    if count == 2:
+        rex_json("split", "-s", session, "-b", first_block, "--split=right", "--ratio", "50", "--", *child_cmd)
+    elif count == 3:
+        b2 = rex_json("split", "-s", session, "-b", first_block, "--split=right", "--ratio", "67", "--", *child_cmd)["block_ids"][0]
+        rex_json("split", "-s", session, "-b", b2, "--split=right", "--ratio", "50", "--", *child_cmd)
+    elif count == 4:
+        b2 = rex_json("split", "-s", session, "-b", first_block, "--split=right", "--ratio", "50", "--", *child_cmd)["block_ids"][0]
+        rex_json("split", "-s", session, "-b", first_block, "--split=below", "--ratio", "50", "--", *child_cmd)
+        rex_json("split", "-s", session, "-b", b2, "--split=below", "--ratio", "50", "--", *child_cmd)
+    elif count > 4:
+        anchor = first_block
+        for i in range(1, count):
+            direction = "right" if i % 2 == 1 else "below"
+            anchor = rex_json("split", "-s", session, "-b", anchor, f"--split={direction}", "--", *child_cmd)["block_ids"][0]
+    say(f"opened {count} sandbox panes ({agent_name}) in Rex session {session}")
+
+
+def mcp_login_one(cfg, sandbox_name, server_name):
+    say(f"starting MCP OAuth login for {server_name} in {sandbox_name}")
+    proc = subprocess.Popen(
+        vc_args(cfg, "exec", sandbox_name, "--", "bash", "-lc", f"~/.local/bin/fx mcp login --no-browser {shlex.quote(server_name)}"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    servers = []
+    opened = False
+
+    def start_forwarder(port):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                target = f"http://127.0.0.1:{port}{self.path}"
+                p = subprocess.run(vc_args(cfg, "exec", sandbox_name, "--", "curl", "-fsS", target), capture_output=True, text=True)
+                body = (p.stdout or "Login sent to sandbox. You can close this tab.").encode()
+                self.send_response(200 if p.returncode == 0 else 502)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        class IPv4Server(http.server.HTTPServer):
+            allow_reuse_address = True
+
+        class IPv6Server(http.server.HTTPServer):
+            address_family = socket.AF_INET6
+            allow_reuse_address = True
+
+        for cls, host in ((IPv4Server, "127.0.0.1"), (IPv6Server, "::1")):
+            try:
+                srv = cls((host, port), Handler)
+                servers.append(srv)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+            except OSError:
+                pass
+
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if not opened:
+                m = re.search(r"https://[^\s]+", line)
+                if m:
+                    auth_url = m.group(0)
+                    qs = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+                    redir = (qs.get("redirect_uri") or [""])[0]
+                    rm = re.search(r"http://(?:localhost|127\.0\.0\.1):(\d+)", redir)
+                    if rm:
+                        start_forwarder(int(rm.group(1)))
+                    opened = True
+                    if shutil.which("open"):
+                        subprocess.run(["open", auth_url], capture_output=True)
+        rc = proc.wait()
+    finally:
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+    if rc != 0:
+        die(f"fx mcp login {server_name} failed (exit {rc})")
+
+
+def cmd_mcp_login(args):
+    cfg = require_config()
+    sb_name, rest = parse_flag(args, "--sandbox", has_value=True)
+    if not rest:
+        die("usage: fxs mcp-login <server...> [--sandbox NAME]", 2)
+    if sb_name:
+        for s in rest:
+            mcp_login_one(cfg, sb_name, s)
+        return
+
+    with file_lock(CACHE_DIR / "base.lock"):
+        base = ensure_base(cfg)
+        tmp_sb = "fxs-mcplogin-" + uuid.uuid4().hex[:6]
+        say(f"booting temporary base sandbox {tmp_sb} to save MCP logins")
+        run_vc(cfg, "create", "--name", tmp_sb, "--snapshot", base["snapshot"], "--vcpus", "2", "--timeout", "15m", capture=True)
+        try:
+            sync_profile_if_needed(cfg, tmp_sb, base.get("profile_hash"))
+            for s in rest:
+                mcp_login_one(cfg, tmp_sb, s)
+            p = run_vc(cfg, "snapshot", "--stop", "--expiration", "0", tmp_sb, capture=True)
+            m = re.search(r"snap_[A-Za-z0-9]+", p.stdout + p.stderr)
+            if not m:
+                die("could not find snapshot ID in output")
+            base["snapshot"] = m.group(0)
+            base["created"] = time.time()
+            with tempfile.TemporaryDirectory() as tmp:
+                _, base["profile_hash"] = build_profile_bundle(tmp, cfg)
+            write_json(BASE_FILE, base)
+            say(f"base snapshot {base['snapshot']} updated with MCP logins")
+        finally:
+            subprocess.run(vc_args(cfg, "rm", tmp_sb), capture_output=True)
+
+
+def cmd_pull(args):
+    cfg = require_config()
+    do_list, args = parse_flag(args, "--list", has_value=False)
+    do_all, args = parse_flag(args, "--all", has_value=False)
+    sessions_only, args = parse_flag(args, "--sessions-only", has_value=False)
+    dest_arg, args = parse_flag(args, "--dest", has_value=True)
+    if not args:
+        die("usage: fxs pull <sandbox-name> [--list | --sessions-only | --all | PATH...] [--dest DIR]", 2)
+    name = args[0]
+    paths = args[1:]
+    rec = read_sandboxes().get(name, {})
+    sync_sessions_back(cfg, name, rec.get("agent", cfg.get("default_agent", "fx")))
+    if sessions_only:
+        return
+    if do_list:
+        print(json.dumps(list_sandbox_files(cfg, name), indent=2))
+        return
+    dest = Path(os.path.expanduser(dest_arg)).resolve() if dest_arg else (PULL_DEFAULT_ROOT / name)
+    if do_all:
+        items = list_sandbox_files(cfg, name)
+        if items:
+            extract_sandbox_paths(cfg, name, [it["path"] for it in items], dest)
+        return
+    if paths:
+        extract_sandbox_paths(cfg, name, paths, dest)
+        return
+    if sys.stdin.isatty():
+        prompt_keep_files(cfg, name)
+
+
+def cmd_local(args):
+    if args:
+        sid = args[0]
+        fx_bin = shutil.which("fx") or str(HOME / ".local" / "bin" / "fx")
+        os.execvp(fx_bin, [fx_bin, "-r", sid])
+    rows = read_json(SESSIONS_INDEX, [])
+    if not rows:
+        say("no sandbox sessions saved locally yet")
+        return
+    print(f"{'ID':<14} {'AGENT':<9} {'SANDBOX':<12} {'TURNS':<6} TITLE")
+    for r in rows:
+        print(f"{r['id']:<14} {r.get('agent','fx'):<9} {r.get('sandbox','?'):<12} {str(r.get('turns',0)):<6} {r.get('title','')}")
+
+
+def resolve_sandbox_and_session(target):
+    data = read_sandboxes()
+    if target in data:
+        return target, data[target].get("session_id"), data[target].get("agent")
+    for sb_name, rec in data.items():
+        if rec.get("session_id") == target:
+            return sb_name, target, rec.get("agent")
+    for r in read_json(SESSIONS_INDEX, []):
+        if r.get("id") == target and r.get("sandbox"):
+            return r["sandbox"], target, r.get("agent")
+    return target, None, None
+
+
+def pick_sandbox_to_resume():
+    data = read_sandboxes()
+    rows = sorted(
+        data.items(),
+        key=lambda kv: float(kv[1].get("last_active") or kv[1].get("stopped_at") or 0),
+        reverse=True,
+    )
+    if not rows:
+        die("no saved sandboxes found; pass a sandbox name: fxs resume <name>", 2)
+    print("Recent sandboxes:", file=sys.stderr)
+    for i, (n, r) in enumerate(rows[:15], 1):
+        state = "running" if r.get("managed") else (r.get("stopped_reason") or "stopped")
+        print(f"  {i}. {n}  [{r.get('agent','fx')}] [{state}]  {r.get('session_id') or '?'}  {r.get('title') or ''}", file=sys.stderr)
+    try:
+        ans = input("Pick number to resume [1]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        sys.exit(130)
+    idx = int(ans) - 1 if ans.isdigit() else (0 if ans == "" else -1)
+    if not (0 <= idx < min(len(rows), 15)):
+        die("invalid selection", 2)
+    return rows[idx][0]
+
+
+def cmd_resume(args):
+    cfg = require_config()
+    flags, agent_args = split_passthrough(args)
+    sid_flag, flags = parse_flag(flags, "--id", has_value=True)
+    agent_flag, flags = parse_flag(flags, "--agent", has_value=True)
+    if not flags and not sid_flag:
+        target = pick_sandbox_to_resume() if sys.stdin.isatty() else die("usage: fxs resume <sandbox|id>", 2)
+    else:
+        target = sid_flag or flags[0]
+    name, resume_id, known_agent = resolve_sandbox_and_session(target)
+    agent_name = agent_flag or known_agent or cfg.get("default_agent", "fx")
+    if resume_id:
+        say(f"resuming {name} ({agent_name} session {resume_id})")
+    run_agent_loop(cfg, name, agent_name, agent_args, continue_first=True, resume_id=resume_id)
+
+
+def cmd_watchdog(args):
+    sub = args[0] if args else "status"
+    if sub == "__run":
+        return run_watchdog_daemon()
+    if sub == "status":
+        cfg = read_config()
+        idle_min = int(os.environ.get("FXS_IDLE_MINUTES", str(cfg.get("idle_minutes", 30))))
+        pid = watchdog_running()
+        data = read_sandboxes()
+        managed = {k: v for k, v in data.items() if v.get("managed")}
+        print(f"watchdog: {'running (pid ' + str(pid) + ')' if pid else 'stopped'}   idle_limit: {idle_min}m")
+        if managed:
+            now = time.time()
+            for name, rec in managed.items():
+                idle_m = (now - float(rec.get("last_active", now))) / 60
+                print(f"  {name}  [{rec.get('agent','fx')}]  session={rec.get('session_id') or '?'}  idle={idle_m:.1f}m  {rec.get('title') or ''}")
+        else:
+            print("  no managed running sandboxes")
+        return 0
+    if sub == "stop":
+        pid = watchdog_running()
+        if not pid:
+            say("watchdog is not running")
+            return 0
+        os.kill(pid, signal.SIGTERM)
+        say(f"stopped watchdog (pid {pid})")
+        return 0
+    die("usage: fxs watchdog [status|stop]", 2)
+
+
+def cmd_agents(args):
+    cfg = read_config()
+    sub = args[0] if args else "list"
+    if sub == "list":
+        shims = all_shims(cfg)
+        default_agent = cfg.get("default_agent", "fx")
+        for name in sorted(shims):
+            mark = " (default)" if name == default_agent else ""
+            print(f"{name:<12}{mark:<10}  {shims[name].description}")
+        return 0
+    if sub == "add":
+        if len(args) < 3:
+            die("usage: fxs agents add <name> <bin_path> [--install CMD]", 2)
+        name, bin_path = args[1], args[2]
+        install_cmd, _ = parse_flag(args[3:], "--install", has_value=True)
+        CUSTOM_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = CUSTOM_AGENTS_DIR / f"{name}.json"
+        write_json(path, {
+            "name": name,
+            "description": f"Custom shim ({name})",
+            "bin_path": bin_path,
+            "install_cmd": install_cmd or "true",
+        })
+        say(f"added custom agent shim at {path}")
+        return 0
+    die("usage: fxs agents [list|add ...]", 2)
+
+
+def cmd_shell(args):
+    cfg = require_config()
+    if not args:
+        die("usage: fxs shell <sandbox-name>", 2)
+    name = args[0]
+    rename_rex_block(name)
+    remote_exec(cfg, name, 'export PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:$PATH"; exec bash -l', interactive=True, check=False)
+
+
+def cmd_ls(_args):
+    run_vc(require_config(), "ls", check=True)
+
+
+def cmd_stop(args):
+    if not args:
+        die("usage: fxs stop <sandbox-name...>", 2)
+    cfg = require_config()
+    run_vc(cfg, "stop", *args)
+    for n in args:
+        update_sandbox_record(n, managed=False, stopped_reason="manual", stopped_at=time.time())
+
+
+def cmd_rm(args):
+    if not args:
+        die("usage: fxs rm <sandbox-name...>", 2)
+    cfg = require_config()
+    run_vc(cfg, "rm", *args)
+    for n in args:
+        update_sandbox_record(n, managed=False)
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if not shutil.which("vercel"):
+        die("vercel CLI not found")
+
+    if not argv:
+        return cmd_new([])
+
+    sub = argv[0]
+    if sub in ("init", "setup"):
+        return cmd_init(argv[1:])
+    if sub == "base":
+        return cmd_base(argv[1:])
+    if sub == "group":
+        return cmd_group(argv[1:])
+    if sub == "mcp-login":
+        return cmd_mcp_login(argv[1:])
+    if sub == "pull":
+        return cmd_pull(argv[1:])
+    if sub == "local":
+        return cmd_local(argv[1:])
+    if sub == "watchdog":
+        return cmd_watchdog(argv[1:])
+    if sub == "agents":
+        return cmd_agents(argv[1:])
+    if sub in ("resume", "r"):
+        return cmd_resume(argv[1:])
+    if sub == "shell":
+        return cmd_shell(argv[1:])
+    if sub in ("ls", "list"):
+        return cmd_ls(argv[1:])
+    if sub == "stop":
+        return cmd_stop(argv[1:])
+    if sub in ("rm", "remove"):
+        return cmd_rm(argv[1:])
+    return cmd_new(argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]) or 0)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
