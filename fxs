@@ -307,10 +307,69 @@ def vc_args(cfg, sub, *args):
     return cmd
 
 
+def tailscale_cli_bin():
+    mac_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    if os.path.isfile(mac_bin) and os.access(mac_bin, os.X_OK):
+        return mac_bin
+    return shutil.which("tailscale")
+
+
+def get_self_tailscale_ip():
+    ts = tailscale_cli_bin()
+    if not ts:
+        return None
+    p = subprocess.run([ts, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    try:
+        d = json.loads(p.stdout)
+    except Exception:
+        return None
+    if d.get("BackendState") != "Running":
+        return None
+    ips = (d.get("Self") or {}).get("TailscaleIPs") or []
+    return next((x for x in ips if "." in x), None)
+
+
+def get_tailscale_peer_ip(name):
+    ts = tailscale_cli_bin()
+    if not ts:
+        return None
+    p = subprocess.run([ts, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    try:
+        d = json.loads(p.stdout)
+    except Exception:
+        return None
+    if d.get("BackendState") != "Running":
+        return None
+    target = name.lower()
+    for peer in (d.get("Peer") or {}).values():
+        hn = (peer.get("HostName") or "").lower()
+        if hn == target and peer.get("Online"):
+            ips = peer.get("TailscaleIPs") or []
+            ip4 = next((x for x in ips if "." in x), None)
+            if ip4:
+                return ip4
+    return None
+
+
+SSH_BASE_OPTS = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=3",
+    "-o", "TCPKeepAlive=yes",
+    "-o", "ConnectTimeout=8",
+]
+
+
 def run_vc(cfg, sub, *args, check=True, capture=False):
     cmd = vc_args(cfg, sub, *args)
     if capture:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if check and p.returncode != 0:
             sys.stderr.write((p.stdout + p.stderr)[-3000:])
             die(f"vercel sandbox {sub} failed (exit {p.returncode})")
@@ -335,7 +394,7 @@ def extract_local_image_paths(data_bytes):
     return found
 
 
-def sync_pasted_images(cfg, name, paths, uploaded_cache):
+def sync_pasted_images(cfg, name, paths, uploaded_cache, ts_ip=None):
     to_send = []
     for p in paths:
         try:
@@ -349,9 +408,16 @@ def sync_pasted_images(cfg, name, paths, uploaded_cache):
         return
     parents = sorted({os.path.dirname(p) for p, _ in to_send})
     mk = " && ".join(f"sudo mkdir -p {shlex.quote(d)} && sudo chown $(id -u):$(id -g) {shlex.quote(d)}" for d in parents)
-    subprocess.run(vc_args(cfg, "exec", name, "--", "bash", "-lc", mk), capture_output=True)
+    if ts_ip and shutil.which("ssh") and shutil.which("scp"):
+        subprocess.run(["ssh", "-o", "BatchMode=yes", *SSH_BASE_OPTS, f"ubuntu@{ts_ip}", mk], stdin=subprocess.DEVNULL, capture_output=True)
+        for p, mt in to_send:
+            cp = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", *SSH_BASE_OPTS, p, f"ubuntu@{ts_ip}:{p}"], stdin=subprocess.DEVNULL, capture_output=True)
+            if cp.returncode == 0:
+                uploaded_cache[p] = mt
+        return
+    subprocess.run(vc_args(cfg, "exec", name, "--", "bash", "-lc", mk), stdin=subprocess.DEVNULL, capture_output=True)
     for p, mt in to_send:
-        cp = subprocess.run(vc_args(cfg, "copy", p, f"{name}:{p}"), capture_output=True)
+        cp = subprocess.run(vc_args(cfg, "copy", p, f"{name}:{p}"), stdin=subprocess.DEVNULL, capture_output=True)
         if cp.returncode == 0:
             uploaded_cache[p] = mt
 
@@ -373,7 +439,14 @@ def reset_local_terminal(saved_attrs=None):
 
 
 def run_interactive_with_image_sync(cfg, name, script):
-    cmd = vc_args(cfg, "exec", "-i", *TERM_ENV, name, "--", "bash", "-lc", script)
+    ts_ip = None
+    if not os.environ.get("FXS_USE_VERCEL_EXEC") and shutil.which("ssh"):
+        ts_ip = get_tailscale_peer_ip(name)
+    if ts_ip:
+        remote_cmd = f"TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 bash -lc {shlex.quote(script)}"
+        cmd = ["ssh", "-t", *SSH_BASE_OPTS, f"ubuntu@{ts_ip}", remote_cmd]
+    else:
+        cmd = vc_args(cfg, "exec", "-i", *TERM_ENV, name, "--", "bash", "-lc", script)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return subprocess.call(cmd)
 
@@ -398,22 +471,34 @@ def run_interactive_with_image_sync(cfg, name, script):
                         except OSError:
                             continue
                         if mt >= start_ts and uploaded.get(full) != mt:
-                            sync_pasted_images(cfg, name, [full], uploaded)
+                            sync_pasted_images(cfg, name, [full], uploaded, ts_ip=ts_ip)
             except OSError:
                 pass
 
             now = time.monotonic()
             if now - last_trace_check >= 3.0:
                 last_trace_check = now
-                p = subprocess.run(
-                    vc_args(cfg, "exec", name, "--", "bash", "-lc", "ls -1 /tmp/fx-trace-*.jsonl 2>/dev/null || true"),
-                    capture_output=True, text=True,
-                )
+                if ts_ip and shutil.which("ssh") and shutil.which("scp"):
+                    p = subprocess.run(
+                        ["ssh", "-o", "BatchMode=yes", *SSH_BASE_OPTS, f"ubuntu@{ts_ip}", "ls -1 /tmp/fx-trace-*.jsonl 2>/dev/null || true"],
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    )
+                else:
+                    p = subprocess.run(
+                        vc_args(cfg, "exec", name, "--", "bash", "-lc", "ls -1 /tmp/fx-trace-*.jsonl 2>/dev/null || true"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    )
                 if p.returncode == 0:
                     for tp in p.stdout.splitlines():
                         tp = tp.strip()
                         if tp and tp not in pulled_traces:
-                            cp = subprocess.run(vc_args(cfg, "copy", f"{name}:{tp}", tp), capture_output=True)
+                            if ts_ip and shutil.which("scp"):
+                                cp = subprocess.run(
+                                    ["scp", "-q", "-o", "BatchMode=yes", *SSH_BASE_OPTS, f"ubuntu@{ts_ip}:{tp}", tp],
+                                    stdin=subprocess.DEVNULL, capture_output=True,
+                                )
+                            else:
+                                cp = subprocess.run(vc_args(cfg, "copy", f"{name}:{tp}", tp), stdin=subprocess.DEVNULL, capture_output=True)
                             if cp.returncode == 0:
                                 pulled_traces.add(tp)
             stop_event.wait(0.35)
@@ -441,7 +526,7 @@ def remote_exec(cfg, name, script, interactive=False, env=None, workdir=None, ch
     args.extend([name, "--", "bash", "-lc", script])
     cmd = vc_args(cfg, "exec", *args)
     if capture:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if check and p.returncode != 0:
             sys.stderr.write((p.stdout + p.stderr)[-3000:])
             die(f"sandbox command failed (exit {p.returncode})")
@@ -658,8 +743,9 @@ def next_slot_name(cfg):
 
 
 def get_tailnet_suffix():
-    if shutil.which("tailscale"):
-        p = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+    ts = tailscale_cli_bin()
+    if ts:
+        p = subprocess.run([ts, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if p.returncode == 0:
             try:
                 suffix = (json.loads(p.stdout).get("MagicDNSSuffix") or "").strip(".")
@@ -926,7 +1012,7 @@ def build_base_setup_script(cfg, agents_to_install):
         'if [ -f /tmp/fxs-profile.tgz ]; then tar -xzf /tmp/fxs-profile.tgz -C "$HOME" && rm -f /tmp/fxs-profile.tgz; fi',
         'if [ -f /tmp/fxs-creds.tgz ]; then (umask 077 && tar -xzf /tmp/fxs-creds.tgz -C "$HOME") && rm -f /tmp/fxs-creds.tgz; fi',
         "missing=()",
-        "for cmd in git rg jq curl unzip dtach; do command -v \"$cmd\" >/dev/null 2>&1 || missing+=(\"$cmd\"); done",
+        "for cmd in git rg jq curl unzip dtach mosh-server; do command -v \"$cmd\" >/dev/null 2>&1 || missing+=(\"$cmd\"); done",
         "command -v ssh-keygen >/dev/null 2>&1 || missing+=(openssh-client)",
         "command -v xz >/dev/null 2>&1 || missing+=(xz-utils)",
     ]
@@ -938,7 +1024,7 @@ def build_base_setup_script(cfg, agents_to_install):
         lines.append("command -v fish >/dev/null 2>&1 || missing+=(fish)")
     lines.extend([
         'if [ "${#missing[@]}" -gt 0 ]; then',
-        "  pkgs=(); for m in \"${missing[@]}\"; do [ \"$m\" = \"rg\" ] && pkgs+=(ripgrep) || pkgs+=(\"$m\"); done",
+        "  pkgs=(); for m in \"${missing[@]}\"; do [ \"$m\" = \"rg\" ] && pkgs+=(ripgrep) || ([ \"$m\" = \"mosh-server\" ] && pkgs+=(mosh) || pkgs+=(\"$m\")); done",
         '  log "installing packages: ${pkgs[*]}"',
         "  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq",
         '  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null',
@@ -1965,11 +2051,12 @@ import os, subprocess, sys
 fd = os.open("/tmp/fxs-tsd.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
 dn = os.open("/dev/null", os.O_RDONLY)
 env = dict(os.environ, TS_ASSUME_NETWORK_UP_FOR_TEST="1")
+tun_mode = "tailscale0" if os.path.exists("/dev/net/tun") else "userspace-networking"
 subprocess.Popen(
-    ["/usr/local/bin/tailscaled", "--tun=userspace-networking",
+    ["/usr/local/bin/tailscaled", f"--tun={tun_mode}",
      "--statedir=" + sys.argv[1],
      "--socket=/tmp/fxs-ts.sock"],
-    stdin=dn, stdout=fd, stderr=fd, start_new_session=True, close_fds=True,
+    stdin=dn, stdout=fd, stderr=fd, env=env, start_new_session=True, close_fds=True,
 )
 PYTS
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -2545,15 +2632,17 @@ def cmd_fit(args):
     if not targets:
         say("no running sandboxes to fit")
         return
+    mac_ip = get_self_tailscale_ip() or ""
     fit_script = r'''
-ssh_pids="$(pgrep -f 'tailscaled be-child ssh' 2>/dev/null | tr '\n' ' ' || true)"
+mac_ip=__MAC_IP__
+other_ssh_pids="$(ps -eo pid=,args= | awk -v mip="$mac_ip" '$0 ~ /tailscaled be-child ssh/ && (mip == "" || index($0, "--remote-ip=" mip) == 0) {print $1}' | tr '\n' ' ' || true)"
 ps -eo pid=,ppid=,tty=,args= | while read -r pid ppid tty rest; do
   case "$tty" in pts/*) ;; *) continue ;; esac
   case "$rest" in *"dtach"*"/tmp/fxs-agent.sock"*) ;; *) continue ;; esac
-  case " $ssh_pids " in *" $ppid "*) continue ;; esac
+  case " $other_ssh_pids " in *" $ppid "*) continue ;; esac
   kill -WINCH "$pid" 2>/dev/null && echo "FIT:$pid:$tty" || true
 done
-mac_tty="$(ps -eo pid=,ppid=,tty=,args= | awk -v sp=" $ssh_pids " '$3 ~ /^pts\// && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ && index(sp, " " $2 " ") == 0 {print $3; exit}')"
+mac_tty="$(ps -eo pid=,ppid=,tty=,args= | awk -v sp=" $other_ssh_pids " '$3 ~ /^pts\// && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ && index(sp, " " $2 " ") == 0 {print $3; exit}')"
 master_pid="$(ps -eo pid=,tty=,args= | awk '$2 == "?" && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ {print $1; exit}')"
 agent_row="$( [ -n "$master_pid" ] && ps -eo pid=,ppid=,tty= | awk -v mp="$master_pid" '$2 == mp && $3 ~ /^pts\// {print $1, $3; exit}' || true )"
 if [ -n "$mac_tty" ] && [ -n "$agent_row" ]; then
@@ -2568,7 +2657,7 @@ if [ -n "$mac_tty" ] && [ -n "$agent_row" ]; then
     kill -WINCH "$ap" 2>/dev/null || true
   fi
 fi
-'''
+'''.replace("__MAC_IP__", shlex.quote(mac_ip))
     for sb in targets:
         p = remote_exec(cfg, sb, fit_script, check=False, capture=True)
         fitted = [l for l in p.stdout.splitlines() if l.startswith("FIT:")]
@@ -2579,10 +2668,12 @@ fi
 def cmd_termius_csv(args):
     cfg = require_config()
     out_arg, args = parse_flag(args, "--out", has_value=True)
+    use_mosh, args = parse_flag(args, "--mosh", has_value=False)
+    proto = "mosh" if use_mosh else "ssh"
     count = 100
     if args:
         if len(args) != 1 or not args[0].isdigit() or int(args[0]) < 1:
-            die("usage: fxs termius-csv [COUNT] [--out FILE]", 2)
+            die("usage: fxs termius-csv [COUNT] [--mosh] [--out FILE]", 2)
         count = int(args[0])
     suffix = get_tailnet_suffix()
     if not suffix:
@@ -2599,12 +2690,12 @@ def cmd_termius_csv(args):
             if m and 1 <= int(m.group(1)) <= count:
                 continue
             seen.add(name)
-            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", "ssh", "22", "ubuntu", ""])
+            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", proto, "22", "ubuntu", ""])
 
     for i in range(1, count + 1):
         name = f"fxs-{i}"
         if name not in seen:
-            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", "ssh", "22", "ubuntu", ""])
+            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", proto, "22", "ubuntu", ""])
 
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
