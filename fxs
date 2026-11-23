@@ -354,94 +354,51 @@ def run_interactive_with_image_sync(cfg, name, script):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return subprocess.call(cmd)
 
-    in_fd = sys.stdin.fileno()
-    out_fd = sys.stdout.fileno()
-    old_tty = termios.tcgetattr(in_fd)
-    master_fd, slave_fd = pty.openpty()
+    stop_event = threading.Event()
+    uploaded = {}
+    pulled_traces = set()
+    tmpdir = os.environ.get("TMPDIR") or "/tmp"
+    start_ts = time.time() - 5.0
 
-    def sync_winsize():
-        try:
-            ws = fcntl.ioctl(in_fd, termios.TIOCGWINSZ, b"\x00" * 8)
-            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, ws)
-        except OSError:
-            pass
-
-    sync_winsize()
-    prev_winch = signal.getsignal(signal.SIGWINCH)
-    signal.signal(signal.SIGWINCH, lambda *_: sync_winsize())
-
-    proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)
-    os.close(slave_fd)
-
-    uploaded_cache = {}
-    paste_buf = bytearray()
-    in_paste = False
-    paste_deadline = 0.0
-
-    def write_all(fd, data):
-        view = memoryview(data)
-        while view:
-            n = os.write(fd, view)
-            view = view[n:]
-
-    def flush_paste():
-        nonlocal in_paste
-        raw = bytes(paste_buf)
-        paste_buf.clear()
-        in_paste = False
-        imgs = extract_local_image_paths(raw)
-        if imgs:
-            sync_pasted_images(cfg, name, imgs, uploaded_cache)
-        write_all(master_fd, raw)
-
-    try:
-        tty.setraw(in_fd)
-        while True:
-            timeout = max(0.0, paste_deadline - time.monotonic()) if in_paste else None
-            rlist = [master_fd] if proc.poll() is not None else [in_fd, master_fd]
+    def watch_clipboard_and_traces():
+        last_trace_check = 0.0
+        while not stop_event.is_set():
             try:
-                ready, _, _ = select.select(rlist, [], [], timeout)
-            except InterruptedError:
-                continue
-            if in_paste and not ready:
-                flush_paste()
-                continue
-            if master_fd in ready:
-                try:
-                    out = os.read(master_fd, 16384)
-                except OSError:
-                    out = b""
-                if not out:
-                    break
-                write_all(out_fd, out)
-            if in_fd in ready:
-                try:
-                    chunk = os.read(in_fd, 4096)
-                except OSError:
-                    chunk = b""
-                if not chunk:
-                    break
-                if in_paste:
-                    paste_buf.extend(chunk)
-                    if b"\x1b[201~" in paste_buf:
-                        flush_paste()
-                elif b"\x1b[200~" in chunk:
-                    in_paste = True
-                    paste_buf.extend(chunk)
-                    paste_deadline = time.monotonic() + 0.15
-                    if b"\x1b[201~" in paste_buf:
-                        flush_paste()
-                else:
-                    imgs = extract_local_image_paths(chunk)
-                    if imgs:
-                        sync_pasted_images(cfg, name, imgs, uploaded_cache)
-                    write_all(master_fd, chunk)
-        return proc.wait()
+                for fn in os.listdir(tmpdir):
+                    if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                        full = os.path.join(tmpdir, fn)
+                        try:
+                            mt = os.path.getmtime(full)
+                        except OSError:
+                            continue
+                        if mt >= start_ts and uploaded.get(full) != mt:
+                            sync_pasted_images(cfg, name, [full], uploaded)
+            except OSError:
+                pass
+
+            now = time.monotonic()
+            if now - last_trace_check >= 3.0:
+                last_trace_check = now
+                p = subprocess.run(
+                    vc_args(cfg, "exec", name, "--", "bash", "-lc", "ls -1 /tmp/fx-trace-*.jsonl 2>/dev/null || true"),
+                    capture_output=True, text=True,
+                )
+                if p.returncode == 0:
+                    for tp in p.stdout.splitlines():
+                        tp = tp.strip()
+                        if tp and tp not in pulled_traces:
+                            cp = subprocess.run(vc_args(cfg, "copy", f"{name}:{tp}", tp), capture_output=True)
+                            if cp.returncode == 0:
+                                pulled_traces.add(tp)
+            stop_event.wait(0.35)
+
+    t = threading.Thread(target=watch_clipboard_and_traces, daemon=True)
+    t.start()
+    try:
+        return subprocess.call(cmd)
     finally:
-        signal.signal(signal.SIGWINCH, prev_winch)
-        with contextlib.suppress(OSError):
-            os.close(master_fd)
-        termios.tcsetattr(in_fd, termios.TCSADRAIN, old_tty)
+        stop_event.set()
+        t.join(timeout=1.0)
 
 
 def remote_exec(cfg, name, script, interactive=False, env=None, workdir=None, check=True, capture=False):
