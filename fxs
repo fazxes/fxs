@@ -3,25 +3,29 @@
 
 Usage:
   fxs init [--yes] [--team T] [--project P] [--agent A] ...   first-time onboarding (interactive or agent-friendly)
-  fxs [--agent A] [--name N] [--timeout 6h] [-- <args...>]     create a sandbox and run the agent in this pane
+  fxs [--agent A] [--name N] [--timeout 6h] [-- <args...>]     create a sandbox (fxs-1, fxs-2, ...) and run the agent
   fxs --split [--agent A] [-- <args...>]                       open a new sandbox in a Rex pane beside this one
   fxs group N [--workspace [LABEL]] [--agent A]                open N sandboxes side by side in Rex
-  fxs resume [NAME|ID] [-- <args...>]                          wake/reattach a sandbox by name or session ID
+  fxs resume [NAME|SLOT|ID|TITLE] [-- <args...>]               wake/reattach by sandbox, slot #, session ID, or title
+  fxs name SANDBOX ALIAS                                       pin a custom nickname for a sandbox
   fxs pull NAME [--list | --all | PATH...] [--dest DIR]        sync sessions & pick files from a sandbox
   fxs local [ID]                                               list pulled fx sessions, or resume ID locally
   fxs watchdog [status|stop]                                   check or stop the idle auto-stop watchdog
   fxs ssh NAME                                                 enable Tailscale SSH on an existing sandbox
+  fxs fit [NAME]                                               snap sandbox PTY size back to your local terminal
   fxs tailscale-key                                            save a reusable Tailscale auth key (auto-enables SSH)
+  fxs termius-csv [COUNT] [--out FILE]                         export Termius CSV for 1..COUNT slots (default: 100)
   fxs signing-setup [--sandbox NAME]                           enable SSH commit signing in base (or one sandbox)
   fxs mcp-login NAME... [--sandbox S]                          sign in to HTTP MCPs via your local browser
   fxs agents [list|add]                                        list built-in and custom agent shims
-  fxs ls                                                       list sandboxes
+  fxs ls [--all] [--raw]                                       list sandboxes with live session titles (100+ paginated)
   fxs stop NAME...                                             stop sandboxes (keeps disk, pauses billing)
   fxs rm NAME...                                               permanently remove sandboxes
   fxs shell NAME                                               open bash in an existing sandbox
   fxs base [--from SANDBOX] [--no-warm]                        build or rebuild the base snapshot
 """
 import contextlib
+import csv
 from dataclasses import dataclass, field
 import fcntl
 import getpass
@@ -64,6 +68,8 @@ WATCHDOG_PID_FILE = CACHE_DIR / "watchdog.pid"
 WATCHDOG_LOCK_FILE = CACHE_DIR / "watchdog.lock"
 WATCHDOG_LOG_FILE = CACHE_DIR / "watchdog.log"
 TAILSCALE_KEY_FILE = CONFIG_DIR / "tailscale.key"
+TAILNET_FILE = CONFIG_DIR / "tailnet.txt"
+SSH_FXS_CONFIG = HOME / ".ssh" / "fxs_config"
 PULL_DEFAULT_ROOT = Path(os.environ.get("FXS_PULL_DIR", str(HOME / "sandbox-pulls")))
 
 EXTRA_PATHS = [
@@ -351,7 +357,7 @@ def sync_pasted_images(cfg, name, paths, uploaded_cache):
 
 
 def reset_local_terminal(saved_attrs=None):
-    """Restore local TTY + Kitty keyboard/mouse/paste modes if remote stream drops mid-TUI."""
+    """Restore local TTY + Kitty/modifyOtherKeys/paste/theme/mouse modes if remote stream drops mid-TUI."""
     if saved_attrs is not None:
         with contextlib.suppress(Exception):
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_attrs)
@@ -359,8 +365,9 @@ def reset_local_terminal(saved_attrs=None):
         with contextlib.suppress(OSError):
             os.write(
                 sys.stdout.fileno(),
-                b"\x1b[<u\x1b[<u\x1b[=0u"
-                b"\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+                b"\x1b[>4;0m\x1b[<u\x1b[<u\x1b[=0u"
+                b"\x1b[?2004l\x1b[?2031l\x1b[?7h"
+                b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
                 b"\x1b[?1004l\x1b[?25h\x1b[0m",
             )
 
@@ -607,8 +614,121 @@ def local_git_identity():
     return name, email
 
 
+def list_sandboxes(cfg, all_states=True, name_prefix=None, max_pages=50):
+    """Paginate `vercel sandbox ls` (50/page API cap) so 100+ sandboxes are never truncated."""
+    rows = []
+    seen = set()
+    cursor = None
+    for _ in range(max_pages):
+        args = ["--limit", "50"]
+        if all_states:
+            args.append("--all")
+        if name_prefix:
+            args.extend(["--name-prefix", name_prefix])
+        if cursor:
+            args.extend(["--cursor", cursor])
+        p = subprocess.run(vc_args(cfg, "ls", *args), capture_output=True, text=True)
+        if p.returncode != 0:
+            break
+        text = p.stdout + "\n" + p.stderr
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in ("running", "stopped", "pending", "stopping", "failed"):
+                name = parts[0]
+                if name not in seen:
+                    seen.add(name)
+                    rows.append((name, parts[1], line))
+        m = re.search(r"--cursor\s+(\S+)", text)
+        if not m or m.group(1) == cursor:
+            break
+        cursor = m.group(1)
+    return rows
+
+
+def next_slot_name(cfg):
+    used = set()
+    for name, _status, _line in list_sandboxes(cfg, all_states=True, name_prefix="fxs-"):
+        m = re.fullmatch(r"fxs-(\d+)", name)
+        if m:
+            used.add(int(m.group(1)))
+    slot = 1
+    while slot in used:
+        slot += 1
+    return f"fxs-{slot}"
+
+
+def get_tailnet_suffix():
+    if shutil.which("tailscale"):
+        p = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+        if p.returncode == 0:
+            try:
+                suffix = (json.loads(p.stdout).get("MagicDNSSuffix") or "").strip(".")
+                if suffix:
+                    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                    TAILNET_FILE.write_text(suffix + "\n")
+                    return suffix
+            except Exception:
+                pass
+    if TAILNET_FILE.exists():
+        val = TAILNET_FILE.read_text().strip(".")
+        if val:
+            return val
+    return ""
+
+
+def sync_ssh_config(cfg):
+    """Maintain ~/.ssh/fxs_config for active sandboxes and ensure ~/.ssh/config includes it."""
+    suffix = get_tailnet_suffix()
+    data = read_sandboxes()
+    running = list_sandboxes(cfg, all_states=False)
+    hosts = []
+    seen = set()
+    for name, _status, _line in running:
+        rec = data.get(name, {})
+        dns = (rec.get("tailscale_dns") or "").strip(".")
+        if not dns and suffix and (name.startswith("fxs-") or rec.get("tailscale_ip")):
+            dns = f"{name}.{suffix}"
+        if dns and name not in seen:
+            seen.add(name)
+            hosts.append((name, dns))
+    for name, rec in sorted(data.items()):
+        if name in seen:
+            continue
+        dns = (rec.get("tailscale_dns") or "").strip(".")
+        if dns and rec.get("managed"):
+            seen.add(name)
+            hosts.append((name, dns))
+
+    ssh_dir = HOME / ".ssh"
+    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lines = ["# Auto-generated by fxs; do not edit by hand.\n"]
+    for name, dns in hosts:
+        lines.append(f"Host {name} {dns}\n")
+        lines.append(f"    HostName {dns}\n")
+        lines.append("    User ubuntu\n")
+        lines.append("    StrictHostKeyChecking no\n")
+        lines.append("    UserKnownHostsFile /dev/null\n\n")
+    fd = os.open(SSH_FXS_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.writelines(lines)
+
+    cfg_path = ssh_dir / "config"
+    inc = "Include fxs_config"
+    if cfg_path.exists():
+        cur = cfg_path.read_text()
+        if cur and not cur.endswith("\n"):
+            cur += "\n"
+        if inc not in cur.splitlines():
+            cfg_path.write_text(inc + "\n" + cur)
+    else:
+        fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(inc + "\n")
+    return len(hosts)
+
+
 def sandbox_exists(cfg, name):
-    p = subprocess.run(vc_args(cfg, "ls", "--name-prefix", name), capture_output=True, text=True)
+    p = subprocess.run(vc_args(cfg, "ls", "--all", "--name-prefix", name), capture_output=True, text=True)
     if p.returncode != 0:
         return False
     return any(line.split()[:1] == [name] for line in p.stdout.splitlines())
@@ -872,16 +992,187 @@ if [ ! -x /usr/local/bin/tailscaled ]; then
   sudo install -m 755 "$tmp"/tailscale_*/tailscaled /usr/local/bin/tailscaled
   rm -rf "$tmp"
 fi
+sudo tee /usr/local/bin/fxs-info >/dev/null <<'FXI'
+#!/usr/bin/env python3
+import json, os, subprocess
+
+state = "stopped"
+title = ""
+fx_bin = os.path.expanduser("~/.local/bin/fx")
+if os.path.isfile(fx_bin):
+    p = subprocess.run([fx_bin, "sessions", "--live", "--all", "--json"], capture_output=True, text=True)
+    sessions = []
+    if p.returncode == 0 and p.stdout.strip():
+        try:
+            sessions = json.loads(p.stdout).get("sessions") or []
+        except Exception:
+            sessions = []
+
+    def any_working(nodes):
+        for n in nodes:
+            if n.get("state") == "working" or any_working(n.get("agents") or []):
+                return True
+        return False
+
+    if sessions:
+        state = "working" if any_working(sessions) else "idle"
+        title = sessions[0].get("title") or ""
+    if not title:
+        idx = os.path.expanduser("~/.fx/sessions/v2/index.jsonl")
+        if os.path.isfile(idx):
+            titles = {}
+            with open(idx, errors="replace") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("op") == "put" and r.get("role", "root") == "root" and r.get("title"):
+                        titles[r["id"]] = (r.get("updated", 0), r["title"])
+            if titles:
+                title = max(titles.values())[1]
+else:
+    pg = subprocess.run(["pgrep", "-f", "/tmp/fxs-agent.sock"], capture_output=True, text=True)
+    if pg.stdout.strip():
+        state = "online"
+
+print(json.dumps({"state": state, "title": title}))
+FXI
+sudo chmod 755 /usr/local/bin/fxs-info
+
 sudo tee /usr/local/bin/fxs-attach >/dev/null <<'FXA'
 #!/bin/sh
-export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"
-if [ -S /tmp/fxs-agent.sock ]; then
-  exec dtach -a /tmp/fxs-agent.sock -E -z -r winch
+if [ "${1:-}" = "--pick" ]; then
+  exec /usr/local/bin/fxs-pick
 fi
-echo "No active agent session socket found (/tmp/fxs-agent.sock)." >&2
-exit 1
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"
+if [ ! -S /tmp/fxs-agent.sock ]; then
+  echo "No active agent session socket found (/tmp/fxs-agent.sock)." >&2
+  exit 1
+fi
+my_tty="$(tty 2>/dev/null | sed 's#^/dev/##' || true)"
+restore_other_clients() {
+  ps -eo pid=,tty=,args= | awk -v mt="$my_tty" '$2 ~ /^pts\// && $2 != mt && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ {print $1}' | while read -r pid; do
+    kill -WINCH "$pid" 2>/dev/null || true
+  done
+}
+trap restore_other_clients EXIT HUP TERM
+if [ -n "$my_tty" ]; then
+  (
+    sleep 0.35
+    master_pid="$(ps -eo pid=,tty=,args= | awk '$2 == "?" && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ {print $1; exit}')"
+    if [ -n "$master_pid" ]; then
+      agent_row="$(ps -eo pid=,ppid=,tty= | awk -v mp="$master_pid" '$2 == mp && $3 ~ /^pts\// {print $1, $3; exit}')"
+      if [ -n "$agent_row" ]; then
+        agent_pid="${agent_row%% *}"
+        agent_tty="${agent_row#* }"
+        set -- $(stty -F "/dev/$my_tty" size 2>/dev/null || true)
+        if [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$2" -gt 20 ]; then
+          stty -F "/dev/$agent_tty" rows "$1" cols "$(( $2 - 1 ))" 2>/dev/null || true
+          kill -WINCH "$agent_pid" 2>/dev/null || true
+          sleep 0.1
+          stty -F "/dev/$agent_tty" rows "$1" cols "$2" 2>/dev/null || true
+          kill -WINCH "$agent_pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+  ) >/dev/null 2>&1 &
+fi
+dtach -a /tmp/fxs-agent.sock -e '^]' -z -r winch
 FXA
 sudo chmod 755 /usr/local/bin/fxs-attach
+
+sudo tee /usr/local/bin/fxs-pick >/dev/null <<'FXP'
+#!/usr/bin/env python3
+from concurrent.futures import ThreadPoolExecutor
+import json, os, re, subprocess, sys
+
+sock = "/tmp/fxs-ts.sock"
+p = subprocess.run(["tailscale", f"--socket={sock}", "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+if p.returncode != 0:
+    print("fxs-pick: tailscale is not running in this sandbox", file=sys.stderr)
+    sys.exit(1)
+
+d = json.loads(p.stdout)
+self_node = d.get("Self") or {}
+nodes = [self_node] + list((d.get("Peer") or {}).values())
+
+def sort_key(n):
+    h = (n.get("HostName") or "").lower()
+    m = re.fullmatch(r"fxs-(\d+)", h)
+    return (0, int(m.group(1)), h) if m else (1, 0, h)
+
+def probe(item):
+    hn, online, ip4, dns, is_self = item
+    if not online:
+        return (hn, "offline", "", ip4, dns, is_self)
+    try:
+        if is_self:
+            r = subprocess.run(["/usr/local/bin/fxs-info"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
+        else:
+            r = subprocess.run(
+                ["tailscale", f"--socket={sock}", "ssh", f"ubuntu@{hn}", "/usr/local/bin/fxs-info"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            )
+        if r.returncode == 0 and r.stdout.strip():
+            info = json.loads(r.stdout.strip().splitlines()[-1])
+            return (hn, info.get("state") or "online", info.get("title") or "", ip4, dns, is_self)
+    except Exception:
+        pass
+    return (hn, "online", "", ip4, dns, is_self)
+
+raw_items = []
+for n in sorted(nodes, key=sort_key):
+    hn = n.get("HostName") or ""
+    if not hn.startswith("fxs-"):
+        continue
+    online = bool(n.get("Online", n is self_node))
+    ips = n.get("TailscaleIPs") or []
+    ip4 = next((x for x in ips if "." in x), "?")
+    dns = (n.get("DNSName") or "").rstrip(".")
+    raw_items.append((hn, online, ip4, dns, n is self_node))
+
+if not raw_items:
+    print("No fxs sandboxes found on Tailscale.")
+    sys.exit(0)
+
+with ThreadPoolExecutor(max_workers=min(12, len(raw_items))) as ex:
+    items = list(ex.map(probe, raw_items))
+
+for i, (hn, st, title, ip4, dns, is_self) in enumerate(items, 1):
+    tag = " *" if is_self else ""
+    label = title or dns or ip4
+    print(f"  {i:3d}. {hn:<12} [{st:<7}]  {label}{tag}")
+
+ans = input("\nPick number or search title (Enter = attach here): ").strip()
+if not ans:
+    os.execvp("/usr/local/bin/fxs-attach", ["/usr/local/bin/fxs-attach"])
+
+chosen = None
+if ans.isdigit() and 1 <= int(ans) <= len(items):
+    chosen = items[int(ans) - 1]
+else:
+    q = ans.lower()
+    matches = [it for it in items if q in it[0].lower() or q in it[2].lower()]
+    if len(matches) == 1:
+        chosen = matches[0]
+    elif len(matches) > 1:
+        for i, (hn, st, title, ip4, dns, is_self) in enumerate(matches, 1):
+            print(f"  {i}. {hn:<12} [{st:<7}]  {title or dns}")
+        sub = input("Pick match [1]: ").strip() or "1"
+        if sub.isdigit() and 1 <= int(sub) <= len(matches):
+            chosen = matches[int(sub) - 1]
+
+if not chosen:
+    print("No matching sandbox", file=sys.stderr)
+    sys.exit(2)
+
+hn, _st, _title, _ip4, _dns, is_self = chosen
+if is_self:
+    os.execvp("/usr/local/bin/fxs-attach", ["/usr/local/bin/fxs-attach"])
+os.execvp("tailscale", ["tailscale", f"--socket={sock}", "ssh", f"ubuntu@{hn}", "-t", "fxs-attach"])
+FXP
+sudo chmod 755 /usr/local/bin/fxs-pick
 '''.strip())
 
     if git_name:
@@ -1042,8 +1333,18 @@ def sync_profile_if_needed(cfg, name, base_hash):
         remote_exec(cfg, name, "tar -xzf /tmp/fxs-profile.tgz -C ~ && rm -f /tmp/fxs-profile.tgz", capture=True)
 
 
-def rename_rex_block(label):
-    block = os.environ.get("REX_BLOCK")
+def format_rex_label(name, title=None, alias=None):
+    tag = alias or title
+    if not tag:
+        return name
+    clean = " ".join(str(tag).split())
+    if len(clean) > 32:
+        clean = clean[:31].rstrip() + "…"
+    return f"{name} · {clean}"
+
+
+def rename_rex_block(label, block_id=None):
+    block = block_id or os.environ.get("REX_BLOCK")
     if not block or not shutil.which("rex"):
         return
     subprocess.run(["rex", "block", "rename", block, label], capture_output=True)
@@ -1470,14 +1771,17 @@ def run_watchdog_daemon():
             if not managed:
                 break
 
-            p = subprocess.run(vc_args(cfg, "ls"), capture_output=True, text=True)
-            if p.returncode != 0:
-                continue
-            running_timeouts = {}
-            for line in p.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == "running":
-                    running_timeouts[parts[0]] = parse_timeout_left_s(line)
+            rows = list_sandboxes(cfg, all_states=False)
+            if not rows:
+                p = subprocess.run(vc_args(cfg, "ls"), capture_output=True, text=True)
+                if p.returncode != 0:
+                    continue
+                rows = [
+                    (line.split()[0], line.split()[1], line)
+                    for line in p.stdout.splitlines()
+                    if len(line.split()) >= 2 and line.split()[1] == "running"
+                ]
+            running_timeouts = {n: parse_timeout_left_s(line) for n, _st, line in rows}
 
             now = time.time()
             for name in managed:
@@ -1499,8 +1803,10 @@ def run_watchdog_daemon():
 
                 sid = info.get("session_id") or rec.get("session_id")
                 title = info.get("title") or rec.get("title")
-                if sid:
+                if sid or title:
                     update_sandbox_record(name, session_id=sid, title=title)
+                    if title and title != rec.get("title") and rec.get("rex_block"):
+                        rename_rex_block(format_rex_label(name, title=title, alias=rec.get("alias")), block_id=rec.get("rex_block"))
 
                 last_active = float(rec.get("last_active") or now)
                 log_mtime = float(info.get("last_log_mtime") or 0.0)
@@ -1530,6 +1836,7 @@ def run_watchdog_daemon():
                 st = subprocess.run(vc_args(cfg, "stop", name), capture_output=True, text=True)
                 if st.returncode == 0:
                     update_sandbox_record(name, managed=False, stopped_reason="idle", stopped_at=now)
+                    sync_ssh_config(cfg)
     finally:
         with contextlib.suppress(OSError):
             WATCHDOG_PID_FILE.unlink()
@@ -1539,8 +1846,12 @@ def run_watchdog_daemon():
 
 def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resume_id=None):
     shim = get_shim(agent_name, cfg)
-    rename_rex_block(name)
-    update_sandbox_record(name, agent=agent_name, managed=True, last_active=time.time(), stopped_reason=None)
+    existing_rec = read_sandboxes().get(name, {})
+    rename_rex_block(format_rex_label(name, title=existing_rec.get("title"), alias=existing_rec.get("alias")))
+    rec_updates = {"agent": agent_name, "managed": True, "last_active": time.time(), "stopped_reason": None}
+    if os.environ.get("REX_BLOCK"):
+        rec_updates["rex_block"] = os.environ["REX_BLOCK"]
+    update_sandbox_record(name, **rec_updates)
     ensure_watchdog(cfg)
 
     first = True
@@ -1549,9 +1860,30 @@ def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resu
         use_continue = continue_first or (not first)
         cmd = shim.launch_command(agent_args, resume_id=resume_id if use_continue else None, continue_last=use_continue and not resume_id)
         exports = "".join(f"export {k}={shlex.quote(str(v))}; " for k, v in shim.extra_env.items())
+        fx_modes = "printf '\\033[>4;2m\\033[>1u\\033[?2004h\\033[?7l\\033[?2031h'; " if agent_name == "fx" else ""
+        reattach_prep = (
+            "if [ -S /tmp/fxs-agent.sock ]; then "
+            f"{fx_modes}"
+            "my_tty=$(tty 2>/dev/null || true); "
+            "(sleep 0.35; "
+            "mp=$(ps -eo pid=,tty=,args= | awk '$2 == \"?\" && $0 ~ /dtach .*\\/tmp\\/fxs-agent\\.sock/ {print $1; exit}'); "
+            "ar=$([ -n \"$mp\" ] && ps -eo pid=,ppid=,tty= | awk -v mp=\"$mp\" '$2 == mp && $3 ~ /^pts\\// {print $1, $3; exit}' || true); "
+            "if [ -n \"$my_tty\" ] && [ -n \"$ar\" ]; then "
+            "  ap=${ar%% *}; at=${ar#* }; "
+            "  read -r r c < <(stty -F \"$my_tty\" size 2>/dev/null || echo ''); "
+            "  if [ -n \"${r:-}\" ] && [ -n \"${c:-}\" ] && [ \"$c\" -gt 20 ]; then "
+            "    stty -F \"/dev/$at\" rows \"$r\" cols \"$((c - 1))\" 2>/dev/null || true; "
+            "    kill -WINCH \"$ap\" 2>/dev/null || true; "
+            "    sleep 0.1; "
+            "    stty -F \"/dev/$at\" rows \"$r\" cols \"$c\" 2>/dev/null || true; "
+            "    kill -WINCH \"$ap\" 2>/dev/null || true; "
+            "  fi; "
+            "fi) >/dev/null 2>&1 & "
+            "fi; "
+        )
         script = (
             'export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.opencode/bin:/usr/local/bin:$PATH"; '
-            f'{exports}exec dtach -A /tmp/fxs-agent.sock -E -z -r winch {cmd}'
+            f'{exports}{reattach_prep}exec dtach -A /tmp/fxs-agent.sock -E -z -r winch {cmd}'
         )
         rc = run_interactive_with_image_sync(cfg, name, script)
         first = False
@@ -1566,19 +1898,22 @@ def run_agent_loop(cfg, name, agent_name, agent_args, continue_first=False, resu
             break
         print(file=sys.stderr)
         if still_running:
-            say(f"connection to {name} dropped (exit {rc}); {agent_name} keeps running in the sandbox.")
-            prompt_msg = "Press Enter to reattach, or 'q' to leave it running in the cloud: "
-        else:
-            say(f"connection/sandbox ended (exit {rc}); your files and session are saved on disk.")
-            prompt_msg = "Press Enter to resume in a new session, or 'q' to quit: "
+            say(f"stream to {name} dropped (exit {rc}); auto-reattaching in 1s (Ctrl+C to detach)...")
+            try:
+                time.sleep(1.0)
+            except KeyboardInterrupt:
+                print(file=sys.stderr)
+                break
+            continue
+        say(f"connection/sandbox ended (exit {rc}); your files and session are saved on disk.")
+        prompt_msg = "Press Enter to resume in a new session, or 'q' to quit: "
         try:
             ans = input(prompt_msg).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if ans == "q":
-            if not still_running:
-                exited = True
+            exited = True
             break
 
     roots = sync_sessions_back(cfg, name, agent_name)
@@ -1658,11 +1993,14 @@ echo "TS_READY|$ts_dns|$ts_ip"
             if line.startswith("TS_READY|"):
                 _, dns, ip = (line.split("|") + ["", ""])[:3]
                 host = dns or ip or name
-                say(f"Tailscale SSH: ubuntu@{host} (ip {ip or '?'}) | run `fxs-attach` inside SSH")
+                update_sandbox_record(name, tailscale_dns=dns or None, tailscale_ip=ip or None)
+                sync_ssh_config(cfg)
+                say(f"Tailscale SSH: ubuntu@{host} (ip {ip or '?'}) | `fxs-attach` or `fxs-pick`")
                 break
     elif key_copied:
         say(f"Tailscale SSH setup failed on {name}: {(p.stdout + p.stderr).strip()[-300:]}")
     else:
+        sync_ssh_config(cfg)
         say(f"Tailscale SSH ready for {name}: connect as ubuntu@{name} and run `fxs-attach`")
 
 
@@ -1810,17 +2148,18 @@ def cmd_new(args):
     if agent_name not in (base.get("agents") or []):
         say(f"agent '{agent_name}' is not in the current base snapshot; installing on boot (run `fxs base --agents {','.join(sorted(set((base.get('agents') or []) + [agent_name])))}` to bake it in)")
 
-    name = name or ("fxs-" + uuid.uuid4().hex[:6])
-    say(f"starting {name} ({agent_name}) from {base['snapshot']}")
-    run_vc(
-        cfg, "create",
-        "--name", name,
-        "--snapshot", base["snapshot"],
-        "--vcpus", str(vcpus or cfg.get("vcpus", "8")),
-        "--timeout", timeout or cfg.get("timeout", "6h"),
-        "--tag", "fxs=1",
-        capture=True,
-    )
+    with file_lock(CACHE_DIR / "slot.lock"):
+        name = name or next_slot_name(cfg)
+        say(f"starting {name} ({agent_name}) from {base['snapshot']}")
+        run_vc(
+            cfg, "create",
+            "--name", name,
+            "--snapshot", base["snapshot"],
+            "--vcpus", str(vcpus or cfg.get("vcpus", "8")),
+            "--timeout", timeout or cfg.get("timeout", "6h"),
+            "--tag", "fxs=1",
+            capture=True,
+        )
     sync_profile_if_needed(cfg, name, base.get("profile_hash"))
     if agent_name not in (base.get("agents") or []):
         shim = get_shim(agent_name, cfg)
@@ -2053,41 +2392,227 @@ def cmd_local(args):
         print(f"{r['id']:<14} {r.get('agent','fx'):<9} {r.get('sandbox','?'):<12} {str(r.get('turns',0)):<6} {r.get('title','')}")
 
 
-def resolve_sandbox_and_session(target):
+def _merged_sandbox_catalog(cfg, include_live=True):
+    """Merge sandboxes.json + sessions.json + live Vercel sandboxes with latest titles."""
     data = read_sandboxes()
-    if target in data:
-        return target, data[target].get("session_id"), data[target].get("agent")
-    for sb_name, rec in data.items():
+    live_map = {}
+    if include_live and cfg:
+        for n, st, line in list_sandboxes(cfg, all_states=True):
+            if n.startswith("fxs-") or n in data:
+                live_map[n] = (st, line)
+
+    rows = {}
+    for n, rec in data.items():
+        r = dict(rec)
+        if n in live_map:
+            r["live_status"] = live_map[n][0]
+            r["live_line"] = live_map[n][1]
+        rows[n] = r
+
+    for n, (st, line) in live_map.items():
+        if n not in rows:
+            rows[n] = {"live_status": st, "live_line": line}
+
+    for item in read_json(SESSIONS_INDEX, []):
+        sb = item.get("sandbox")
+        if sb and sb in rows:
+            rows[sb].setdefault("session_id", item.get("id"))
+            rows[sb].setdefault("title", item.get("title"))
+            rows[sb].setdefault("agent", item.get("agent"))
+
+    def sort_key(kv):
+        n, r = kv
+        is_running = 1 if (r.get("live_status") == "running" or r.get("managed")) else 0
+        ts = float(r.get("last_active") or r.get("stopped_at") or 0)
+        return (is_running, ts, n)
+
+    return sorted(rows.items(), key=sort_key, reverse=True)
+
+
+def _format_row(idx, n, r):
+    state = r.get("live_status") or ("running" if r.get("managed") else (r.get("stopped_reason") or "stopped"))
+    agent = r.get("agent") or "fx"
+    sid = r.get("session_id") or "-"
+    alias = f" ({r['alias']})" if r.get("alias") else ""
+    title = r.get("title") or "(untitled)"
+    return f"  {idx:2d}. {n:<12} [{agent}] [{state:<7}]  {sid:<13} {title}{alias}"
+
+
+def resolve_sandbox_and_session(target, cfg=None, include_live=True):
+    rows = _merged_sandbox_catalog(cfg, include_live=include_live and cfg is not None)
+    by_name = dict(rows)
+
+    if target in by_name:
+        r = by_name[target]
+        return target, r.get("session_id"), r.get("agent")
+
+    if target.isdigit() and f"fxs-{target}" in by_name:
+        sb = f"fxs-{target}"
+        r = by_name[sb]
+        return sb, r.get("session_id"), r.get("agent")
+
+    for sb_name, rec in rows:
         if rec.get("session_id") == target:
             return sb_name, target, rec.get("agent")
     for r in read_json(SESSIONS_INDEX, []):
         if r.get("id") == target and r.get("sandbox"):
             return r["sandbox"], target, r.get("agent")
-    return target, None, None
+
+    q = target.lower()
+    for sb_name, rec in rows:
+        if (rec.get("alias") or "").lower() == q:
+            return sb_name, rec.get("session_id"), rec.get("agent")
+
+    matches = [
+        (n, r) for n, r in rows
+        if q in n.lower()
+        or q in (r.get("alias") or "").lower()
+        or q in (r.get("title") or "").lower()
+    ]
+    if len(matches) == 1:
+        n, r = matches[0]
+        return n, r.get("session_id"), r.get("agent")
+    if len(matches) > 1:
+        if sys.stdin.isatty():
+            n = pick_sandbox_to_resume(cfg, matches, header=f"Multiple sandboxes match '{target}':")
+            r = by_name[n]
+            return n, r.get("session_id"), r.get("agent")
+        listing = "\n".join(_format_row(i, n, r) for i, (n, r) in enumerate(matches, 1))
+        die(f"multiple sandboxes match '{target}':\n{listing}", 2)
+
+    if cfg and sandbox_exists(cfg, target):
+        return target, None, None
+
+    if not cfg:
+        return target, None, None
+    listing = "\n".join(_format_row(i, n, r) for i, (n, r) in enumerate(rows[:20], 1))
+    die(f"no sandbox matched '{target}'. Known sandboxes:\n{listing}" if listing else f"no sandbox matched '{target}'", 2)
 
 
-def pick_sandbox_to_resume():
-    data = read_sandboxes()
-    rows = sorted(
-        data.items(),
-        key=lambda kv: float(kv[1].get("last_active") or kv[1].get("stopped_at") or 0),
-        reverse=True,
-    )
+def pick_sandbox_to_resume(cfg=None, rows=None, header="Sandboxes:"):
+    if rows is None:
+        rows = _merged_sandbox_catalog(cfg, include_live=cfg is not None)
     if not rows:
         die("no saved sandboxes found; pass a sandbox name: fxs resume <name>", 2)
-    print("Recent sandboxes:", file=sys.stderr)
-    for i, (n, r) in enumerate(rows[:15], 1):
-        state = "running" if r.get("managed") else (r.get("stopped_reason") or "stopped")
-        print(f"  {i}. {n}  [{r.get('agent','fx')}] [{state}]  {r.get('session_id') or '?'}  {r.get('title') or ''}", file=sys.stderr)
+    print(header, file=sys.stderr)
+    for i, (n, r) in enumerate(rows, 1):
+        print(_format_row(i, n, r), file=sys.stderr)
     try:
-        ans = input("Pick number to resume [1]: ").strip()
+        ans = input("Pick number or type part of title/name [1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print(file=sys.stderr)
         sys.exit(130)
-    idx = int(ans) - 1 if ans.isdigit() else (0 if ans == "" else -1)
-    if not (0 <= idx < min(len(rows), 15)):
+    if ans == "":
+        return rows[0][0]
+    if ans.isdigit():
+        idx = int(ans) - 1
+        if 0 <= idx < len(rows):
+            return rows[idx][0]
         die("invalid selection", 2)
-    return rows[idx][0]
+    q = ans.lower()
+    matches = [
+        (n, r) for n, r in rows
+        if q in n.lower() or q in (r.get("alias") or "").lower() or q in (r.get("title") or "").lower()
+    ]
+    if len(matches) == 1:
+        return matches[0][0]
+    if len(matches) > 1:
+        return pick_sandbox_to_resume(cfg, matches, header=f"Matches for '{ans}':")
+    die(f"no sandbox matched '{ans}'", 2)
+
+
+def cmd_name(args):
+    cfg = require_config()
+    if len(args) < 2:
+        die("usage: fxs name <sandbox-name> <alias...>", 2)
+    sb, _sid, _ag = resolve_sandbox_and_session(args[0], cfg=cfg)
+    alias = " ".join(args[1:]).strip()
+    update_sandbox_record(sb, alias=alias)
+    rec = read_sandboxes().get(sb, {})
+    if rec.get("rex_block"):
+        rename_rex_block(format_rex_label(sb, title=rec.get("title"), alias=alias), block_id=rec["rex_block"])
+    say(f"named {sb} -> '{alias}' (resume with `fxs resume {shlex.quote(alias)}`)")
+
+
+def cmd_fit(args):
+    """Send SIGWINCH + 1-col bounce to non-SSH dtach/agent PTYs so sandboxes snap back to local width."""
+    cfg = require_config()
+    if args:
+        sb, _sid, _ag = resolve_sandbox_and_session(" ".join(args), cfg=cfg)
+        targets = [sb]
+    else:
+        targets = [n for n, _st, _line in list_sandboxes(cfg, all_states=False) if n.startswith("fxs-")]
+    if not targets:
+        say("no running sandboxes to fit")
+        return
+    fit_script = r'''
+ssh_pids="$(pgrep -f 'tailscaled be-child ssh' 2>/dev/null | tr '\n' ' ' || true)"
+ps -eo pid=,ppid=,tty=,args= | while read -r pid ppid tty rest; do
+  case "$tty" in pts/*) ;; *) continue ;; esac
+  case "$rest" in *"dtach"*"/tmp/fxs-agent.sock"*) ;; *) continue ;; esac
+  case " $ssh_pids " in *" $ppid "*) continue ;; esac
+  kill -WINCH "$pid" 2>/dev/null && echo "FIT:$pid:$tty" || true
+done
+mac_tty="$(ps -eo pid=,ppid=,tty=,args= | awk -v sp=" $ssh_pids " '$3 ~ /^pts\// && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ && index(sp, " " $2 " ") == 0 {print $3; exit}')"
+master_pid="$(ps -eo pid=,tty=,args= | awk '$2 == "?" && $0 ~ /dtach .*\/tmp\/fxs-agent\.sock/ {print $1; exit}')"
+agent_row="$( [ -n "$master_pid" ] && ps -eo pid=,ppid=,tty= | awk -v mp="$master_pid" '$2 == mp && $3 ~ /^pts\// {print $1, $3; exit}' || true )"
+if [ -n "$mac_tty" ] && [ -n "$agent_row" ]; then
+  ap="${agent_row%% *}"
+  at="${agent_row#* }"
+  read -r rows cols < <(stty -F "/dev/$mac_tty" size 2>/dev/null || echo "")
+  if [ -n "${rows:-}" ] && [ -n "${cols:-}" ] && [ "$cols" -gt 20 ]; then
+    stty -F "/dev/$at" rows "$rows" cols "$((cols - 1))" 2>/dev/null || true
+    kill -WINCH "$ap" 2>/dev/null || true
+    sleep 0.1
+    stty -F "/dev/$at" rows "$rows" cols "$cols" 2>/dev/null || true
+    kill -WINCH "$ap" 2>/dev/null || true
+  fi
+fi
+'''
+    for sb in targets:
+        p = remote_exec(cfg, sb, fit_script, check=False, capture=True)
+        fitted = [l for l in p.stdout.splitlines() if l.startswith("FIT:")]
+        if fitted:
+            say(f"fitted {sb} back to local width ({', '.join(fitted)})")
+
+
+def cmd_termius_csv(args):
+    cfg = require_config()
+    out_arg, args = parse_flag(args, "--out", has_value=True)
+    count = 100
+    if args:
+        if len(args) != 1 or not args[0].isdigit() or int(args[0]) < 1:
+            die("usage: fxs termius-csv [COUNT] [--out FILE]", 2)
+        count = int(args[0])
+    suffix = get_tailnet_suffix()
+    if not suffix:
+        die("could not detect Tailscale MagicDNSSuffix; ensure Tailscale is running locally")
+
+    out_path = Path(os.path.expanduser(out_arg)).resolve() if out_arg else (CONFIG_DIR / f"termius-{count}.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    seen = set()
+    for name, _st, _line in list_sandboxes(cfg, all_states=False):
+        if name.startswith("fxs-"):
+            m = re.fullmatch(r"fxs-(\d+)", name)
+            if m and 1 <= int(m.group(1)) <= count:
+                continue
+            seen.add(name)
+            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", "ssh", "22", "ubuntu", ""])
+
+    for i in range(1, count + 1):
+        name = f"fxs-{i}"
+        if name not in seen:
+            rows.append(["fxs", name, "fxs", f"{name}.{suffix}", "ssh", "22", "ubuntu", ""])
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Groups", "Label", "Tags", "Hostname/IP", "Protocol", "Port", "Username", "Password"])
+        w.writerows(rows)
+
+    say(f"wrote {len(rows)} hosts (fxs-1..fxs-{count} + active) to {out_path}")
+    print(str(out_path))
 
 
 def cmd_resume(args):
@@ -2096,13 +2621,14 @@ def cmd_resume(args):
     sid_flag, flags = parse_flag(flags, "--id", has_value=True)
     agent_flag, flags = parse_flag(flags, "--agent", has_value=True)
     if not flags and not sid_flag:
-        target = pick_sandbox_to_resume() if sys.stdin.isatty() else die("usage: fxs resume <sandbox|id>", 2)
+        target = pick_sandbox_to_resume(cfg) if sys.stdin.isatty() else die("usage: fxs resume <sandbox|slot|id|title>", 2)
     else:
-        target = sid_flag or flags[0]
-    name, resume_id, known_agent = resolve_sandbox_and_session(target)
+        target = sid_flag or " ".join(flags)
+    name, resume_id, known_agent = resolve_sandbox_and_session(target, cfg=cfg)
     agent_name = agent_flag or known_agent or cfg.get("default_agent", "fx")
-    if resume_id:
-        say(f"resuming {name} ({agent_name} session {resume_id})")
+    rec = read_sandboxes().get(name, {})
+    title_note = f" — {rec['title']}" if rec.get("title") else ""
+    say(f"resuming {name} ({agent_name}" + (f" {resume_id}" if resume_id else "") + ")" + title_note)
     if TAILSCALE_KEY_FILE.exists() and not os.environ.get("FXS_NO_TAILSCALE"):
         start_sandbox_tailscale(cfg, name, interactive_if_no_key=False)
     run_agent_loop(cfg, name, agent_name, agent_args, continue_first=True, resume_id=resume_id)
@@ -2175,8 +2701,31 @@ def cmd_shell(args):
     remote_exec(cfg, name, 'export PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:$PATH"; exec bash -l', interactive=True, check=False)
 
 
-def cmd_ls(_args):
-    run_vc(require_config(), "ls", check=True)
+def cmd_ls(args):
+    cfg = require_config()
+    raw_mode, args = parse_flag(args, "--raw", has_value=False)
+    show_all, args = parse_flag(args, "--all", has_value=False)
+    if raw_mode or args:
+        run_vc(cfg, "ls", *(["--all"] if show_all else []), *args, check=True)
+        return
+    rows = list_sandboxes(cfg, all_states=show_all)
+    if not rows:
+        say("no running sandboxes" if not show_all else "no sandboxes")
+        return
+    data = read_sandboxes()
+    print(f"{'NAME':<14} {'AGENT':<9} {'STATUS':<8} {'TIMEOUT':<12} {'SESSION':<14} TITLE")
+    for name, st, line in rows:
+        if show_all and not (name.startswith("fxs-") or name in data):
+            continue
+        rec = data.get(name, {})
+        m = re.search(r"\b(in\s+\d+\s+\w+s?)\b", line)
+        left = m.group(1) if m else "-"
+        agent = rec.get("agent") or "-"
+        sid = rec.get("session_id") or "-"
+        alias = f" [{rec['alias']}]" if rec.get("alias") else ""
+        title = (rec.get("title") or "-") + alias
+        print(f"{name:<14} {agent:<9} {st:<8} {left:<12} {sid:<14} {title}")
+    sync_ssh_config(cfg)
 
 
 def cmd_stop(args):
@@ -2186,6 +2735,7 @@ def cmd_stop(args):
     run_vc(cfg, "stop", *args)
     for n in args:
         update_sandbox_record(n, managed=False, stopped_reason="manual", stopped_at=time.time())
+    sync_ssh_config(cfg)
 
 
 def cmd_rm(args):
@@ -2195,6 +2745,7 @@ def cmd_rm(args):
     run_vc(cfg, "rm", *args)
     for n in args:
         update_sandbox_record(n, managed=False)
+    sync_ssh_config(cfg)
 
 
 def main(argv):
@@ -2224,12 +2775,18 @@ def main(argv):
         return cmd_watchdog(argv[1:])
     if sub == "ssh":
         return cmd_ssh(argv[1:])
+    if sub == "fit":
+        return cmd_fit(argv[1:])
     if sub == "tailscale-key":
         return cmd_tailscale_key(argv[1:])
+    if sub == "termius-csv":
+        return cmd_termius_csv(argv[1:])
     if sub == "signing-setup":
         return cmd_signing_setup(argv[1:])
     if sub == "agents":
         return cmd_agents(argv[1:])
+    if sub == "name":
+        return cmd_name(argv[1:])
     if sub in ("resume", "r"):
         return cmd_resume(argv[1:])
     if sub == "shell":

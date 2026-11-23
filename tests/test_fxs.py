@@ -98,6 +98,8 @@ class TestFxs(unittest.TestCase):
         self.assertIn("openssh-client", script)
         self.assertIn("tailscaled", script)
         self.assertIn("fxs-attach", script)
+        self.assertIn("fxs-info", script)
+        self.assertIn("fxs-pick", script)
         self.assertIn("zig", script)
         self.assertIn("bun", script)
         self.assertIn("https://fx.sh/setup.sh", script)
@@ -136,6 +138,32 @@ class TestFxs(unittest.TestCase):
         self.assertEqual(fxs.resolve_default_project(None), "vercel-sandbox-default-project")
         self.assertEqual(fxs.resolve_default_project(""), "vercel-sandbox-default-project")
         self.assertEqual(fxs.resolve_default_project("custom-proj"), "custom-proj")
+
+    def test_resolve_sandbox_by_slot_title_alias_and_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_sb = fxs.SANDBOXES_FILE
+            old_si = fxs.SESSIONS_INDEX
+            try:
+                fxs.SANDBOXES_FILE = Path(tmp) / "sandboxes.json"
+                fxs.SESSIONS_INDEX = Path(tmp) / "sessions.json"
+                fxs.SANDBOXES_FILE.write_text(json.dumps({
+                    "fxs-1": {"agent": "fx", "session_id": "sess_aaa", "title": "Fix Auth Token Refresh", "managed": True},
+                    "fxs-2": {"agent": "claude", "session_id": "sess_bbb", "title": "Refactor Billing UI", "alias": "billing", "managed": True},
+                }))
+                self.assertEqual(fxs.resolve_sandbox_and_session("1", include_live=False), ("fxs-1", "sess_aaa", "fx"))
+                self.assertEqual(fxs.resolve_sandbox_and_session("auth", include_live=False), ("fxs-1", "sess_aaa", "fx"))
+                self.assertEqual(fxs.resolve_sandbox_and_session("billing", include_live=False), ("fxs-2", "sess_bbb", "claude"))
+                self.assertEqual(fxs.resolve_sandbox_and_session("sess_bbb", include_live=False), ("fxs-2", "sess_bbb", "claude"))
+            finally:
+                fxs.SANDBOXES_FILE = old_sb
+                fxs.SESSIONS_INDEX = old_si
+
+    def test_format_rex_label(self):
+        self.assertEqual(fxs.format_rex_label("fxs-1"), "fxs-1")
+        self.assertEqual(fxs.format_rex_label("fxs-1", title="Fix Auth"), "fxs-1 · Fix Auth")
+        self.assertEqual(fxs.format_rex_label("fxs-1", title="Fix Auth", alias="auth"), "fxs-1 · auth")
+        long_label = fxs.format_rex_label("fxs-1", title="A" * 50)
+        self.assertTrue(long_label.endswith("…"))
 
 
 if __name__ == "__main__":

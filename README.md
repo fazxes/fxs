@@ -55,8 +55,9 @@ fxs --agent codex            # boot a sandbox with Codex
 fxs --agent opencode         # boot a sandbox with OpenCode
 fxs --timeout 12h            # override session timeout
 
-fxs resume                   # pick a recent sandbox to wake/reattach
-fxs resume <sandbox-or-id>   # wake/reattach by sandbox name or session ID
+fxs resume                   # pick any sandbox (by number or title search) to wake/reattach
+fxs resume <name|slot|id|q>  # wake/reattach by sandbox name, slot #, session ID, or title word
+fxs name <sandbox> <alias>   # pin a custom nickname for a sandbox
 
 fxs pull <sandbox>           # sync sessions and interactively pick files to keep
 fxs pull <sandbox> --list    # JSON list of files in the sandbox
@@ -65,8 +66,10 @@ fxs local                    # list locally saved sandbox sessions
 fxs watchdog status                  # inspect idle watchdog state
 fxs tailscale-key                    # save reusable Tailscale auth key (auto-enables SSH)
 fxs ssh <sandbox>                    # enable Tailscale SSH on an existing sandbox
+fxs fit [sandbox]                    # snap sandbox PTY width back to your desktop terminal
+fxs termius-csv [100] [--out FILE]   # export Termius CSV for fxs-1..fxs-N Tailscale hosts
 fxs signing-setup [--sandbox NAME]   # enable SSH commit signing in base or one sandbox
-fxs ls                               # list sandboxes
+fxs ls [--all] [--raw]               # list sandboxes with live session titles (100+ paginated)
 fxs stop <sandbox>           # stop sandbox (keeps disk, pauses billing)
 fxs rm <sandbox>             # delete sandbox
 ```
